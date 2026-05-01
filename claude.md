@@ -35,7 +35,7 @@ crawl_core/
 │   ├── __init__.py
 │   ├── config.py             # all constants and thresholds (no .env, pure Python)
 │   ├── main.py              # FastAPI app, /crawl endpoint, lifespan management
-│   ├── crawler.py            # fetch URL via httpx (primary)
+│   ├── fetcher.py            # fetch URL via curl_cffi (primary)
 │   ├── detector.py           # analyze HTML to detect JS-heavy skeleton pages
 │   ├── js_renderer.py        # Playwright fallback for JS-heavy pages
 │   ├── parser.py             # extract metadata from HTML (BS4)
@@ -44,7 +44,7 @@ crawl_core/
 │   └── schemas.py            # Pydantic request/response models
 ├── tests/
 │   ├── __init__.py
-│   ├── test_crawler.py
+│   ├── test_fetcher.py
 │   ├── test_detector.py
 │   ├── test_parser.py
 │   ├── test_extractor.py
@@ -137,14 +137,14 @@ Content-Type: application/json
 
 ## Module Specifications
 
-### crawler.py
+### fetcher.py
 
 Primary HTTP fetch. Always attempted first (~200ms).
 
-- Use `httpx.AsyncClient` with:
+- Use `curl_cffi.requests.AsyncSession` with:
     - Timeout: 15 seconds
-    - `User-Agent`: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36`
-    - `follow_redirects=True`, `max_redirects=5`
+    - `impersonate="chrome120"` (sets UA + TLS fingerprint)
+    - `allow_redirects=True`, `max_redirects=5`
 - Track final `resolved_url` from `response.url` after redirects.
 - Respect HTTP status codes: return structured error for 4xx/5xx.
 - Return: raw HTML string, final URL, status code.
@@ -160,7 +160,7 @@ class CrawlResult:
 
 ### detector.py
 
-Analyzes raw HTML from `crawler.py` to determine if the page is a JS-heavy skeleton needing Playwright. Returns a `FetchAnalysis` dataclass.
+Analyzes raw HTML from `fetcher.py` to determine if the page is a JS-heavy skeleton needing Playwright. Returns a `FetchAnalysis` dataclass.
 
 ```python
 @dataclass
@@ -368,7 +368,7 @@ Application entrypoint with lifecycle management.
 ```
 POST /crawl { url }
   │
-  ├─ 1. crawler.fetch(url)               → CrawlResult (HTML + resolved_url)     ~200ms
+  ├─ 1. fetcher.fetch(url)               → CrawlResult (HTML + resolved_url)     ~200ms
   │
   ├─ 2. detector.analyze(html)           → FetchAnalysis
   │      │
