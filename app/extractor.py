@@ -1,0 +1,74 @@
+import logging
+import re
+
+import trafilatura
+from bs4 import BeautifulSoup
+
+from app.config import READING_SPEED_WPM
+from app.schemas import ContentResponse
+
+logger = logging.getLogger(__name__)
+
+STRIP_TAGS = {"script", "style", "nav", "footer", "header", "aside"}
+
+
+def extract(html: str, url: str) -> ContentResponse:
+    logger.info("starting extraction | url=%s html_length=%d", url, len(html))
+
+    body_text = _extract_trafilatura(html, url)
+
+    if not body_text:
+        logger.warning("trafilatura returned empty, falling back to bs4 | url=%s", url)
+        body_text = _extract_bs4_fallback(html, url)
+
+    if not body_text:
+        logger.warning("both extractors returned empty | url=%s", url)
+        return ContentResponse(body_text="", word_count=0, reading_time_minutes=0.0)
+
+    word_count = len(body_text.split())
+    reading_time = round(word_count / READING_SPEED_WPM, 1)
+
+    logger.info(
+        "extraction complete | url=%s word_count=%d reading_time=%.1f method=%s",
+        url, word_count, reading_time,
+        "trafilatura" if body_text else "bs4_fallback",
+    )
+
+    return ContentResponse(
+        body_text=body_text,
+        word_count=word_count,
+        reading_time_minutes=reading_time,
+    )
+
+
+def _extract_trafilatura(html: str, url: str) -> str:
+    try:
+        text = trafilatura.extract(html, include_comments=False, include_tables=False)
+        if text:
+            logger.info("trafilatura extracted %d chars | url=%s", len(text), url)
+            return text
+        return ""
+    except Exception as exc:
+        logger.warning("trafilatura error, will try fallback | url=%s error=%s", url, exc)
+        return ""
+
+
+def _extract_bs4_fallback(html: str, url: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for tag in soup.find_all(STRIP_TAGS):
+            tag.decompose()
+
+        if not soup.body:
+            logger.warning("no <body> tag found | url=%s", url)
+            return ""
+
+        text = soup.body.get_text(separator=" ", strip=True)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if text:
+            logger.info("bs4 fallback extracted %d chars | url=%s", len(text), url)
+        return text
+    except Exception as exc:
+        logger.warning("bs4 fallback error | url=%s error=%s", url, exc)
+        return ""
