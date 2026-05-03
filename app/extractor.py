@@ -1,10 +1,17 @@
 import logging
 import re
+from urllib.parse import urlparse
 
 import trafilatura
 from bs4 import BeautifulSoup
 
-from app.config import READING_SPEED_WPM
+from app.config import (
+    PRUNE_SELECTORS,
+    PRUNE_TAGS,
+    PRUNE_XPATH,
+    READING_SPEED_WPM,
+    SITE_PRUNE_SELECTORS,
+)
 from app.schemas import ContentResponse
 
 logger = logging.getLogger(__name__)
@@ -15,11 +22,12 @@ STRIP_TAGS = {"script", "style", "nav", "footer", "header", "aside"}
 def extract(html: str, url: str) -> ContentResponse:
     logger.info("starting extraction | url=%s html_length=%d", url, len(html))
 
-    body_text = _extract_trafilatura(html, url)
+    pruned = _prune_html(html, url)
+    body_text = _extract_trafilatura(pruned, url)
 
     if not body_text:
         logger.warning("trafilatura returned empty, falling back to bs4 | url=%s", url)
-        body_text = _extract_bs4_fallback(html, url)
+        body_text = _extract_bs4_fallback(pruned, url)
 
     if not body_text:
         logger.warning("both extractors returned empty | url=%s", url)
@@ -41,9 +49,54 @@ def extract(html: str, url: str) -> ContentResponse:
     )
 
 
+def _prune_html(html: str, url: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "lxml")
+
+        main = soup.find("main") or soup.find(attrs={"role": "main"}) or soup.find("article")
+        if main and len(main.get_text(strip=True)) > 200:
+            head = soup.find("head")
+            pruned = BeautifulSoup("<html></html>", "lxml")
+            html_tag = pruned.find("html")
+            if head and html_tag:
+                html_tag.append(head.extract())
+            if html_tag:
+                html_tag.append(main.extract())
+            logger.info("narrowed to <%s> container | url=%s", main.name, url)
+            return str(pruned)
+
+        for tag_name in PRUNE_TAGS:
+            for tag in soup.find_all(tag_name):
+                tag.decompose()
+
+        for selector in PRUNE_SELECTORS:
+            for el in soup.select(selector):
+                el.decompose()
+
+        hostname = urlparse(url).hostname or ""
+        for domain_pattern, selectors in SITE_PRUNE_SELECTORS.items():
+            if domain_pattern in hostname:
+                for selector in selectors:
+                    for el in soup.select(selector):
+                        el.decompose()
+
+        logger.info("pruned html | url=%s output_length=%d", url, len(str(soup)))
+        return str(soup)
+    except Exception as exc:
+        logger.warning("prune failed, using original html | url=%s error=%s", url, exc)
+        return html
+
+
 def _extract_trafilatura(html: str, url: str) -> str:
     try:
-        text = trafilatura.extract(html, include_comments=False, include_tables=False)
+        text = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=False,
+            favor_precision=True,
+            deduplicate=True,
+            prune_xpath=PRUNE_XPATH,
+        )
         if text:
             logger.info("trafilatura extracted %d chars | url=%s", len(text), url)
             return text

@@ -1,11 +1,20 @@
+import asyncio
 import logging
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import psutil
+
+import spacy
+import yake
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-
 from playwright.async_api import TimeoutError as PlaywrightTimeout
+from playwright.async_api import async_playwright
+from transformers import pipeline as hf_pipeline
 
+from app.classifier import classify
 from app.config import LOG_FORMAT, LOG_LEVEL
 from app.detector import analyze
 from app.extractor import extract
@@ -17,7 +26,88 @@ from app.schemas import CrawlRequest, CrawlResponse
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+
+def _get_rss_mb() -> float:
+    return psutil.Process().memory_info().rss / (1024 * 1024)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    startup_start = time.perf_counter()
+    startup_rss = _get_rss_mb()
+    logger.info("=== startup begin ===")
+
+    t0 = time.perf_counter()
+    rss0 = _get_rss_mb()
+    app.state.classifier = hf_pipeline(
+        "zero-shot-classification", model="facebook/bart-large-mnli")
+    logger.info("loaded bart-mnli | time=%.2fs mem=+%.0fMB",
+                time.perf_counter() - t0, _get_rss_mb() - rss0)
+
+    t0 = time.perf_counter()
+    rss0 = _get_rss_mb()
+    app.state.nlp = spacy.load("en_core_web_lg")
+    logger.info("loaded spacy-en | time=%.2fs mem=+%.0fMB",
+                time.perf_counter() - t0, _get_rss_mb() - rss0)
+
+    t0 = time.perf_counter()
+    rss0 = _get_rss_mb()
+    app.state.kw_extractor = yake.KeywordExtractor(lan="en", n=2, top=10)
+    logger.info("loaded yake | time=%.2fs mem=+%.0fMB",
+                time.perf_counter() - t0, _get_rss_mb() - rss0)
+
+    t0 = time.perf_counter()
+    rss0 = _get_rss_mb()
+    app.state.playwright = await async_playwright().start()
+    logger.info("loaded playwright-engine | time=%.2fs mem=+%.0fMB",
+                time.perf_counter() - t0, _get_rss_mb() - rss0)
+
+    t0 = time.perf_counter()
+    rss0 = _get_rss_mb()
+    app.state.browser = await app.state.playwright.chromium.launch(
+        headless=True,
+        handle_sigint=False,
+        handle_sigterm=False,
+        handle_sighup=False,
+        args=["--no-sandbox", "--disable-dev-shm-usage"])
+    logger.info("loaded chromium-browser | time=%.2fs mem=+%.0fMB",
+                time.perf_counter() - t0, _get_rss_mb() - rss0)
+
+    total_time = time.perf_counter() - startup_start
+    total_mem = _get_rss_mb() - startup_rss
+    logger.info("=== startup complete | total_time=%.2fs total_mem=+%.0fMB services=5 ===",
+                total_time, total_mem)
+
+    yield
+
+    shutdown_start = time.perf_counter()
+    logger.info("=== shutdown begin ===")
+
+    t0 = time.perf_counter()
+    try:
+        if app.state.browser.is_connected():
+            await app.state.browser.close()
+            logger.info("closed chromium-browser | time=%.2fs",
+                        time.perf_counter() - t0)
+        else:
+            logger.info(
+                "chromium-browser already terminated | time=%.2fs", time.perf_counter() - t0)
+    except Exception as exc:
+        logger.warning("chromium-browser close failed | error=%s", exc)
+
+    t0 = time.perf_counter()
+    try:
+        await app.state.playwright.stop()
+        logger.info("closed playwright-engine | time=%.2fs",
+                    time.perf_counter() - t0)
+    except Exception as exc:
+        logger.warning("playwright-engine close failed | error=%s", exc)
+
+    logger.info("=== shutdown complete | total_time=%.2fs ===",
+                time.perf_counter() - shutdown_start)
+
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[
                    "*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -25,9 +115,10 @@ app.add_middleware(CORSMiddleware, allow_origins=[
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    logger.info("health check hit")
-    return {"status": "ok"}
+async def health(request: Request) -> dict:
+    models_loaded = all(hasattr(request.app.state, attr)
+                        for attr in ("classifier", "nlp", "kw_extractor", "browser"))
+    return {"status": "ok", "models_loaded": models_loaded}
 
 
 @app.post("/crawl", response_model=CrawlResponse)
@@ -41,11 +132,12 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
         status = "success" if result.error is None else "error"
         logger.info("crawl complete | status=%s url=%s", status, url)
 
-        render_method = "httpx"
+        render_method = "curl_cffi"
         render_reason = "default fetch via curl_cffi"
         render_error = None
         metadata = None
         content = None
+        classification = None
 
         if result.error is None:
             analysis = analyze(result.html, result.resolved_url)
@@ -58,7 +150,7 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
                     logger.warning(
                         "playwright needed but browser not available | url=%s", url)
                     render_reason = analysis.reason + \
-                        " (browser not initialized, using httpx)"
+                        " (browser not initialized, using curl_cffi)"
                 else:
                     render_method = "playwright"
                     render_reason = analysis.reason
@@ -71,26 +163,38 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
                             html_for_extract = rendered_html
                     except PlaywrightTimeout:
                         logger.warning("playwright timed out | url=%s", url)
-                        render_method = "httpx"
-                        render_reason += " (playwright timed out, using httpx)"
+                        render_method = "curl_cffi"
+                        render_reason += " (playwright timed out, using curl_cffi)"
                         render_error = "JS rendering timed out; partial results from static HTML"
                     except Exception as exc:
                         logger.warning(
-                            "playwright render failed, using httpx HTML | url=%s error=%s",
+                            "playwright render failed, using curl_cffi HTML | url=%s error=%s",
                             url, exc,
                         )
-                        render_method = "httpx"
+                        render_method = "curl_cffi"
                         render_reason += " (playwright fallback failed)"
             else:
                 render_reason = analysis.reason
 
-            logger.info("starting metadata parse | url=%s", url)
-            metadata = parse(html_for_parse, result.resolved_url)
-            logger.info("metadata parse complete | url=%s", url)
+            loop = asyncio.get_running_loop()
 
-            logger.info("starting content extraction | url=%s", url)
-            content = extract(html_for_extract, result.resolved_url)
-            logger.info("content extraction complete | url=%s", url)
+            logger.info("starting parse + extract (parallel) | url=%s", url)
+            metadata, content = await asyncio.gather(
+                loop.run_in_executor(
+                    None, parse, html_for_parse, result.resolved_url),
+                loop.run_in_executor(
+                    None, extract, html_for_extract, result.resolved_url),
+            )
+            logger.info("parse + extract complete | url=%s", url)
+
+            classification = None
+            if content and content.body_text:
+                models = {
+                    "classifier": request.app.state.classifier,
+                    "nlp": request.app.state.nlp,
+                    "kw_extractor": request.app.state.kw_extractor,
+                }
+                classification = await classify(content.body_text, models, metadata)
 
         return CrawlResponse(
             status=status,
@@ -103,6 +207,7 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
             content_length=len(result.html),
             metadata=metadata,
             content=content,
+            classification=classification,
             error=render_error or result.error,
         )
 
@@ -129,3 +234,8 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
 
 
 # curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "https://www.shopmygear.com/products/gear-bravo-16-25l-medium-water-resistant-school-bag-casual-backpack-daypack-travel-backpack-kids-bag-for-boys-girls-blue-cream-copy?variant=51512016273725&country=IN&currency=INR&utm_medium=product_sync&utm_source=google&utm_content=sag_organic&utm_campaign=sag_organic&utm_source=google_ads&utm_medium=cpc&utm_campaign=ADB_Pmax_Feed_Only_All_Products_04082025&gad_source=1&gad_campaignid=22868092978&gbraid=0AAAABAKw6MCC-B8fLNUY75LlFhn5P5ubR&gclid=CjwKCAjwntHPBhAaEiwA_Xp6RquumbL85cIqi38B_hL5_gqlq-J1Kkq5feJbgnlSXh69L_ARU6KlthoCJ8IQAvD_BwE"}'
+
+
+# curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "https://www.nike.in/nike-downshifter-14-men-s-road-running-shoe/p/24928858"}'
+
+# curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "https://www.airbnb.co.in/rooms/985240485996289865?check_in=2026-05-08&check_out=2026-05-10&photo_id=1744922689&source_impression_id=p3_1777804742_P3Q59jRkTBhOn8-3&previous_page_section_name=1000"}'

@@ -116,6 +116,8 @@ def _extract_favicon(soup: BeautifulSoup, url: str) -> str | None:
         if tag:
             href = tag.get("href")
             if href:
+                if href.startswith("data:"):
+                    continue
                 logger.info("extracted favicon | rel=%s favicon=%s", rel, href)
                 return href
 
@@ -195,12 +197,32 @@ def _extract_structured_data(soup: BeautifulSoup, url: str) -> list[dict]:
     return results
 
 
-def _extract_headings(soup: BeautifulSoup, url: str) -> dict[str, list[str]]:
-    h1s = [tag.get_text(strip=True)
-           for tag in soup.find_all("h1") if tag.get_text(strip=True)]
-    h2s = [tag.get_text(strip=True)
-           for tag in soup.find_all("h2") if tag.get_text(strip=True)]
+_SKIP_PARENTS = {"nav", "footer", "header", "aside"}
+_SKIP_PATTERNS = {"skip to", "keyboard shortcut", "product summary presents"}
 
-    logger.info("extracted headings | h1_count=%d h2_count=%d",
-                len(h1s), len(h2s))
+
+def _extract_headings(soup: BeautifulSoup, url: str) -> dict[str, list[str]]:
+    h1s = []
+    for tag in soup.find_all("h1"):
+        text = tag.get_text(strip=True)
+        if not text or _is_junk_heading(tag, text):
+            continue
+        h1s.append(text)
+
+    h2s = []
+    for tag in soup.find_all("h2"):
+        text = tag.get_text(strip=True)
+        if not text or _is_junk_heading(tag, text):
+            continue
+        h2s.append(text)
+
+    logger.info("extracted headings | h1_count=%d h2_count=%d", len(h1s), len(h2s))
     return {"h1": h1s, "h2": h2s}
+
+
+def _is_junk_heading(tag, text: str) -> bool:
+    for parent in tag.parents:
+        if parent.name in _SKIP_PARENTS:
+            return True
+    lower = text.lower()
+    return any(p in lower for p in _SKIP_PATTERNS)
