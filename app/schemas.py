@@ -62,7 +62,7 @@ class CrawlResponse(BaseModel):
     url: str
     resolved_url: str
     crawled_at: str | None = None
-    render_method: str = "httpx"
+    render_method: str = "curl_cffi"
     render_reason: str = "default fetch via curl_cffi"
     status_code: int
     content_length: int
