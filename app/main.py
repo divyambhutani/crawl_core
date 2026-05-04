@@ -3,6 +3,7 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.auth import TokenAuthMiddleware
 from app.lifespan import lifespan
 from app.pipeline import run_pipeline
 from app.schemas import CrawlRequest, CrawlResponse
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[
                    "*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(TokenAuthMiddleware)
 
 
 @app.get("/health")
