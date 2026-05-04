@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import re
 
-from app.schemas import ClassificationResponse, Entity, MetadataResponse, TopicScore
+from app.config import BODY_TEXT_LIMIT, TOP_K_KEYWORDS, TOPIC_THRESHOLD
+from app.schemas import ClassificationResponse, MetadataResponse, TopicScore
 
 logger = logging.getLogger(__name__)
 
@@ -10,134 +12,396 @@ PAGE_TYPE_LABELS = [
     "landing page", "documentation", "forum discussion", "other",
 ]
 
-TOPIC_LABELS = [
-    "technology", "business", "health", "science", "sports",
-    "entertainment", "politics", "education", "food & cooking",
-    "travel", "fashion", "finance", "real estate", "automotive",
-    "home & garden", "outdoor recreation", "electronics",
-    "software", "artificial intelligence", "e-commerce",
+IAB_TIER1_LABELS = [
+    "Arts & Entertainment", "Automotive", "Business & Finance",
+    "Careers", "Education", "Family & Parenting",
+    "Food & Drink", "Health & Fitness", "Hobbies & Interests",
+    "Home & Garden", "Law, Government & Politics", "News",
+    "Personal Finance", "Pets", "Real Estate",
+    "Religion & Spirituality", "Science", "Shopping",
+    "Society", "Sports", "Style & Fashion",
+    "Technology & Computing", "Travel",
 ]
 
-TOPIC_THRESHOLD = 0.3
-BODY_TEXT_LIMIT = 512
-ENTITY_TEXT_LIMIT = 10000
-ENTITY_LABELS = {"ORG", "PERSON", "GPE", "MONEY", "DATE", "PRODUCT"}
-METADATA_PREFIX_BUDGET = 200
+SCHEMA_TYPE_TO_PAGE_TYPE: dict[str, tuple[str, float] | None] = {
+    "Product": ("product page", 1.0),
+    "IndividualProduct": ("product page", 1.0),
+    "ProductGroup": ("product page", 1.0),
+    "ItemPage": ("product page", 0.9),
+    "BlogPosting": ("blog post", 0.95),
+    "LiveBlogPosting": ("blog post", 0.95),
+    "Article": ("blog post", 0.9),
+    "Recipe": ("blog post", 0.9),
+    "NewsArticle": ("news article", 0.95),
+    "ReportageNewsArticle": ("news article", 0.95),
+    "TechArticle": ("documentation", 0.95),
+    "HowTo": ("documentation", 0.9),
+    "FAQPage": ("documentation", 0.9),
+    "APIReference": ("documentation", 0.95),
+    "DiscussionForumPosting": ("forum discussion", 0.95),
+    "QAPage": ("forum discussion", 0.9),
+    "Question": ("forum discussion", 0.9),
+    "CollectionPage": ("landing page", 0.85),
+    "SearchResultsPage": ("landing page", 0.85),
+    "WebPage": None,
+    "WebSite": None,
+    "Corporation": None,
+    "Organization": None,
+}
+
+_TITLE_SUFFIX_RE = re.compile(r"\s*[|–—\-]\s*[^|–—\-]{3,30}$")
+_TITLE_SPLIT_RE = re.compile(r"\s*[|–—]\s*")
+
+
+def _flatten_structured_data(raw: list) -> list[dict]:
+    result: list[dict] = []
+    for item in raw:
+        if isinstance(item, dict):
+            graph = item.get("@graph")
+            if isinstance(graph, list):
+                for g in graph:
+                    if isinstance(g, dict):
+                        result.append(g)
+            elif item.get("@type"):
+                result.append(item)
+        elif isinstance(item, list):
+            result.extend(_flatten_structured_data(item))
+    return result
+
+
+PAGE_LEVEL_TYPES = {
+    "BlogPosting", "LiveBlogPosting", "Article", "NewsArticle",
+    "ReportageNewsArticle", "TechArticle", "Recipe", "HowTo", "FAQPage",
+    "APIReference", "DiscussionForumPosting", "QAPage", "Question",
+}
+
+
+def _resolve_page_type_from_structured_data(
+    structured_data: list[dict],
+) -> tuple[str, float] | None:
+    best_page_level: tuple[str, float] | None = None
+    best_embedded: tuple[str, float] | None = None
+    for item in structured_data:
+        raw_type = item.get("@type")
+        if not raw_type:
+            continue
+        types = raw_type if isinstance(raw_type, list) else [raw_type]
+        for t in types:
+            mapping = SCHEMA_TYPE_TO_PAGE_TYPE.get(t)
+            if not mapping:
+                continue
+            if t in PAGE_LEVEL_TYPES:
+                if best_page_level is None or mapping[1] > best_page_level[1]:
+                    best_page_level = mapping
+            else:
+                if best_embedded is None or mapping[1] > best_embedded[1]:
+                    best_embedded = mapping
+    return best_page_level or best_embedded
+
+
+def _text_overlap(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    a_lower, b_lower = a.lower(), b.lower()
+    shorter, longer = (a_lower, b_lower) if len(a_lower) <= len(b_lower) else (b_lower, a_lower)
+    if shorter in longer and len(shorter) / len(longer) >= 0.7:
+        return 1.0
+    a_words = set(a_lower.split())
+    b_words = set(b_lower.split())
+    if not a_words or not b_words:
+        return 0.0
+    intersection = a_words & b_words
+    return len(intersection) / min(len(a_words), len(b_words))
 
 
 def _build_classifier_text(body_text: str, metadata: MetadataResponse | None) -> str:
     if not metadata:
-        return body_text
-    parts = []
-    if metadata.title:
-        parts.append(metadata.title.strip())
-    if metadata.description:
-        parts.append(metadata.description.strip())
-    if not parts:
-        return body_text
-    prefix = " | ".join(parts)
-    if len(prefix) > METADATA_PREFIX_BUDGET:
-        prefix = prefix[:METADATA_PREFIX_BUDGET].rsplit(" ", 1)[0]
-    return f"{prefix}\n{body_text}"
+        return body_text[:BODY_TEXT_LIMIT]
+
+    parts: list[str] = []
+
+    title = (metadata.title or "").strip()
+    if title:
+        parts.append(title)
+
+    h1_texts = metadata.headings.get("h1", []) if metadata.headings else []
+    for h1 in h1_texts[:1]:
+        h1 = h1.strip()
+        if h1 and _text_overlap(h1, title) < 0.8:
+            parts.append(h1)
+
+    desc = (metadata.description or "").strip()
+    if desc and _text_overlap(desc, title) < 0.8:
+        parts.append(desc)
+
+    prefix = "\n".join(parts)
+    if prefix and body_text:
+        combined = f"{prefix}\n{body_text}"
+    elif prefix:
+        combined = prefix
+    else:
+        combined = body_text
+
+    return combined[:BODY_TEXT_LIMIT]
 
 
 async def classify(
     body_text: str, models: dict, metadata: MetadataResponse | None = None,
+    executor=None,
 ) -> ClassificationResponse:
     logger.info("starting classification | text_length=%d", len(body_text))
     loop = asyncio.get_running_loop()
 
+    structured_data = _flatten_structured_data(metadata.structured_data if metadata else [])
+
+    sd_result = _resolve_page_type_from_structured_data(structured_data)
     classifier_text = _build_classifier_text(body_text, metadata)
 
     keywords_future = loop.run_in_executor(
-        None, _extract_keywords, body_text, models["kw_extractor"])
-    classification_future = loop.run_in_executor(
-        None, _classify_page_and_topics, classifier_text, models["classifier"])
-    entities_future = loop.run_in_executor(
-        None, _extract_entities, body_text, models["nlp"])
+        None, _extract_keywords_hybrid, body_text, metadata, models, structured_data)
 
-    keywords, (page_type, confidence, topics), entities = await asyncio.gather(
-        keywords_future, classification_future, entities_future)
+    if sd_result:
+        page_type, confidence = sd_result
+        topics_future = loop.run_in_executor(
+            executor, _run_topic_classification, classifier_text, models["classifier"])
+        keywords, topics = await asyncio.gather(keywords_future, topics_future)
+        logger.info("page_type from structured data: %s (%.2f)", page_type, confidence)
+    else:
+        classification_future = loop.run_in_executor(
+            executor, _classify_page_and_topics, classifier_text, models["classifier"])
+        keywords, (page_type, confidence, topics) = await asyncio.gather(
+            keywords_future, classification_future)
 
-    summary = _build_summary(page_type, topics, entities)
+    iab_categories = [t.topic for t in topics[:3]]
+    summary = _build_summary(page_type, topics, structured_data, metadata)
 
     logger.info(
-        "classification complete | page_type=%s confidence=%.2f topics=%d keywords=%d entities=%d",
-        page_type, confidence, len(topics), len(keywords), len(entities),
+        "classification complete | page_type=%s confidence=%.2f topics=%d keywords=%d",
+        page_type, confidence, len(topics), len(keywords),
     )
 
     return ClassificationResponse(
         page_type=page_type,
         page_type_confidence=round(confidence, 3),
         topics=topics,
+        iab_categories=iab_categories,
         keywords=keywords,
-        entities=entities,
         summary=summary,
     )
 
 
-def _extract_keywords(text: str, kw_extractor) -> list[str]:
-    results = kw_extractor.extract_keywords(text)
-    return [kw for kw, _score in sorted(results, key=lambda x: x[1])]
+def _extract_keywords_hybrid(
+    body_text: str, metadata: MetadataResponse | None, models: dict,
+    structured_data: list[dict] | None = None,
+) -> list[str]:
+    keywords: list[str] = []
+
+    if metadata:
+        sd = structured_data if structured_data is not None else _flatten_structured_data(metadata.structured_data)
+        _add_tier1_jsonld(keywords, sd)
+        _add_tier2_title_h1(keywords, metadata, models.get("nlp"))
+        _add_tier3_og(keywords, metadata)
+
+    if len(keywords) < TOP_K_KEYWORDS:
+        _add_tier4_yake(keywords, body_text, models["kw_extractor"])
+
+    return keywords[:TOP_K_KEYWORDS]
 
 
-def _classify_page_and_topics(text: str, classifier) -> tuple[str, float, list[TopicScore]]:
-    truncated = text[:BODY_TEXT_LIMIT]
+def _add_tier1_jsonld(keywords: list[str], structured_data: list[dict]) -> None:
+    for item in structured_data:
+        schema_type = item.get("@type")
+        if not schema_type:
+            continue
+        types = schema_type if isinstance(schema_type, list) else [schema_type]
+        type_set = set(types)
 
-    page_result = classifier(
-        truncated,
-        candidate_labels=PAGE_TYPE_LABELS,
-        hypothesis_template="This is a {}.",
-    )
-    page_type = page_result["labels"][0]
-    confidence = page_result["scores"][0]
+        if type_set & {"Product", "IndividualProduct", "ProductGroup"}:
+            name = item.get("name", "")
+            if isinstance(name, str) and name:
+                _add_unique(keywords, name)
+            brand = item.get("brand")
+            if isinstance(brand, dict):
+                brand_name = brand.get("name", "")
+                if isinstance(brand_name, str) and brand_name and brand_name != name:
+                    _add_unique(keywords, brand_name)
+            elif isinstance(brand, str) and brand:
+                _add_unique(keywords, brand)
+            category = item.get("category")
+            if isinstance(category, str) and category:
+                _add_unique(keywords, category)
 
-    topic_result = classifier(
-        truncated,
-        candidate_labels=TOPIC_LABELS,
+        if type_set & {"BlogPosting", "NewsArticle", "Article", "TechArticle"}:
+            headline = item.get("headline") or item.get("name", "")
+            if isinstance(headline, str) and headline:
+                _add_unique(keywords, headline)
+
+        jsonld_keywords = item.get("keywords")
+        if isinstance(jsonld_keywords, str):
+            for kw in jsonld_keywords.split(","):
+                kw = kw.strip()
+                if kw:
+                    _add_unique(keywords, kw)
+        elif isinstance(jsonld_keywords, list):
+            for kw in jsonld_keywords:
+                if isinstance(kw, str) and kw.strip():
+                    _add_unique(keywords, kw.strip())
+
+
+def _add_tier2_title_h1(
+    keywords: list[str], metadata: MetadataResponse, nlp,
+) -> None:
+    texts: list[str] = []
+
+    title = metadata.title or ""
+    if title:
+        segments = _TITLE_SPLIT_RE.split(title)
+        texts.extend(seg.strip() for seg in segments if seg.strip())
+
+    h1_texts = metadata.headings.get("h1", []) if metadata.headings else []
+    for h1 in h1_texts[:2]:
+        h1 = h1.strip()
+        if h1:
+            texts.append(h1)
+
+    for text in texts:
+        if nlp and len(text) > 5:
+            doc = nlp(text)
+            for chunk in doc.noun_chunks:
+                phrase = chunk.text.strip()
+                if len(phrase) > 2:
+                    _add_unique(keywords, phrase)
+        else:
+            parts = re.split(r"\s*[,:\-]\s*", text)
+            for part in parts:
+                part = part.strip()
+                if len(part) > 2:
+                    _add_unique(keywords, part)
+
+
+def _add_tier3_og(keywords: list[str], metadata: MetadataResponse) -> None:
+    title = (metadata.title or "").lower()
+    og = metadata.open_graph
+    if not og:
+        return
+
+    if (og.og_type or "").lower() == "website":
+        return
+    og_title = (og.og_title or "").strip()
+    if og_title and _text_overlap(og_title, title) < 0.8:
+        parts = _TITLE_SPLIT_RE.split(og_title)
+        for part in parts:
+            part = part.strip()
+            if len(part) > 2:
+                _add_unique(keywords, part)
+
+    og_desc = (og.og_description or "").strip()
+    if og_desc and _text_overlap(og_desc, title) < 0.8:
+        words = og_desc.split()
+        if len(words) <= 15:
+            _add_unique(keywords, og_desc)
+
+
+def _add_tier4_yake(
+    keywords: list[str], body_text: str, kw_extractor,
+) -> None:
+    results = kw_extractor.extract_keywords(body_text)
+    sorted_results = sorted(results, key=lambda x: x[1])
+    for kw, _score in sorted_results:
+        if len(kw) > 2:
+            _add_unique(keywords, kw)
+        if len(keywords) >= TOP_K_KEYWORDS:
+            break
+
+
+def _add_unique(keywords: list[str], candidate: str) -> None:
+    if len(keywords) >= TOP_K_KEYWORDS:
+        return
+    candidate_lower = candidate.lower().strip()
+    if len(candidate_lower) < 3:
+        return
+    for existing in keywords:
+        existing_lower = existing.lower()
+        if candidate_lower == existing_lower:
+            return
+        if candidate_lower in existing_lower or existing_lower in candidate_lower:
+            return
+        if _text_overlap(candidate, existing) > 0.8:
+            return
+    keywords.append(candidate)
+
+
+def _run_topic_classification(text: str, classifier) -> list[TopicScore]:
+    result = classifier(
+        text,
+        candidate_labels=IAB_TIER1_LABELS,
         hypothesis_template="This text is about {}.",
         multi_label=True,
     )
-    topics = [
+    return [
         TopicScore(topic=label, relevance_score=round(score, 3))
-        for label, score in zip(topic_result["labels"], topic_result["scores"])
+        for label, score in zip(result["labels"], result["scores"])
         if score >= TOPIC_THRESHOLD
     ]
 
-    return page_type, confidence, topics
+
+def _classify_page_and_topics(
+    text: str, classifier,
+) -> tuple[str, float, list[TopicScore]]:
+    page_result = classifier(
+        text,
+        candidate_labels=PAGE_TYPE_LABELS,
+        hypothesis_template="This is a {}.",
+    )
+    topics = _run_topic_classification(text, classifier)
+    return page_result["labels"][0], page_result["scores"][0], topics
 
 
-def _extract_entities(text: str, nlp) -> list[Entity]:
-    doc = nlp(text[:ENTITY_TEXT_LIMIT])
-    doc_words_lower = {t.text for t in doc if t.is_alpha and t.text.islower()}
-
-    seen = set()
-    entities = []
-    for ent in doc.ents:
-        if ent.label_ not in ENTITY_LABELS:
+def _extract_name_from_structured_data(structured_data: list[dict]) -> str | None:
+    for item in structured_data:
+        raw_type = item.get("@type")
+        if not raw_type:
             continue
-        if "\n" in ent.text:
-            continue
-        normalized = ent.text.strip().rstrip(",.")
-        if len(normalized) < 2 or len(normalized) > 80:
-            continue
-        if normalized.isupper() and len(normalized) <= 4:
-            continue
-        if ent.label_ == "PERSON":
-            alpha_tokens = [t for t in ent if t.is_alpha]
-            if alpha_tokens and all(t.text.lower() in doc_words_lower for t in alpha_tokens):
-                continue
-        key = (normalized, ent.label_)
-        if key in seen:
-            continue
-        seen.add(key)
-        entities.append(Entity(text=normalized, label=ent.label_))
-    return entities
+        types = raw_type if isinstance(raw_type, list) else [raw_type]
+        for t in types:
+            mapping = SCHEMA_TYPE_TO_PAGE_TYPE.get(t)
+            if mapping is not None:
+                name = item.get("headline") or item.get("name")
+                if name and len(name) > 3:
+                    return name
+    return None
 
 
-def _build_summary(page_type: str, topics: list[TopicScore], entities: list[Entity]) -> str:
-    topic_names = ", ".join(t.topic for t in topics[:3]) or "general content"
-    entity_names = ", ".join(e.text for e in entities[:3])
-    if entity_names:
-        return f"A {page_type} about {topic_names}, featuring {entity_names}."
-    return f"A {page_type} about {topic_names}."
+def _clean_title(title: str) -> str:
+    cleaned = _TITLE_SUFFIX_RE.sub("", title).strip()
+    if len(cleaned) > 80:
+        trunc = cleaned[:80]
+        last_comma = trunc.rfind(",")
+        if last_comma > 30:
+            cleaned = trunc[:last_comma].strip()
+        else:
+            last_space = trunc.rfind(" ")
+            if last_space > 0:
+                cleaned = trunc[:last_space].strip()
+    return cleaned
+
+
+def _build_summary(
+    page_type: str,
+    topics: list[TopicScore],
+    structured_data: list[dict],
+    metadata: MetadataResponse | None,
+) -> str:
+    topic_part = ", ".join(t.topic for t in topics[:3]) or "general content"
+
+    sd_name = _extract_name_from_structured_data(structured_data)
+    if sd_name:
+        return f"{sd_name} — a {page_type} about {topic_part}."
+
+    title = (metadata.title if metadata else None) or ""
+    if title:
+        cleaned = _clean_title(title)
+        if cleaned and len(cleaned) > 5:
+            return f"{cleaned} — a {page_type} about {topic_part}."
+
+    return f"A {page_type} about {topic_part}."

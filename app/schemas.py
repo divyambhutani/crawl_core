@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, HttpUrl
 
 
@@ -29,7 +31,7 @@ class MetadataResponse(BaseModel):
     open_graph: OpenGraphResponse | None = None
     twitter_card: TwitterCardResponse | None = None
     structured_data: list = []
-    headings: dict[str, list[str]] = {"h1": [], "h2": []}
+    headings: dict[str, list[str]] = {"h1": [], "h2": [], "h3": []}
 
 
 class ContentResponse(BaseModel):
@@ -43,17 +45,12 @@ class TopicScore(BaseModel):
     relevance_score: float
 
 
-class Entity(BaseModel):
-    text: str
-    label: str
-
-
 class ClassificationResponse(BaseModel):
     page_type: str
     page_type_confidence: float
     topics: list[TopicScore] = []
+    iab_categories: list[str] = []
     keywords: list[str] = []
-    entities: list[Entity] = []
     summary: str
 
 
@@ -62,7 +59,7 @@ class CrawlResponse(BaseModel):
     url: str
     resolved_url: str
     crawled_at: str | None = None
-    render_method: str = "curl_cffi"
+    render_method: Literal["curl_cffi", "playwright"] = "curl_cffi"
     render_reason: str = "default fetch via curl_cffi"
     status_code: int
     content_length: int

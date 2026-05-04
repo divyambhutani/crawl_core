@@ -39,6 +39,11 @@ PRUNE_XPATH = [
     '//section[contains(@class, "comment")]',
 ]
 
+# ── Classifier ──
+BODY_TEXT_LIMIT = 2800
+TOPIC_THRESHOLD = 0.75
+TOP_K_KEYWORDS = 10
+
 # ── Detector ──
 MIN_BODY_LENGTH = 200
 MIN_CONTENT_ELEMENTS = 5
