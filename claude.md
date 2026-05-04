@@ -9,12 +9,11 @@ A FastAPI service that takes a single URL, crawls the page, extracts HTML metada
 - **Language:** Python 3.12+
 - **Framework:** FastAPI (async)
 - **HTTP Client:** curl_cffi (async) — primary fetch with browser TLS fingerprinting
-- **JS Rendering:** Playwright (async, Chromium) — fallback for JS-heavy/SPA pages
-- **HTML Parsing:** BeautifulSoup4 (bs4) with `lxml` parser
+- **JS Rendering:** Playwright (async, Chromium) + playwright-stealth — fallback for JS-heavy/SPA pages, with anti-bot evasion
+- **HTML Parsing:** Selectolax (lexbor) primary, BeautifulSoup4 (bs4) + `lxml` fallback
 - **Body Text Extraction:** trafilatura (with BS4 fallback)
 - **Keyword Extraction:** YAKE (statistical, no model needed)
 - **Page Classification:** transformers + `facebook/bart-large-mnli` (zero-shot, NLI-based)
-- **NER:** spaCy `en_core_web_lg`
 
 ### Why These Choices
 
@@ -24,8 +23,8 @@ A FastAPI service that takes a single URL, crawls the page, extracts HTML metada
 | JS rendering    | Playwright          | Official Python SDK, async API, resource blocking. Selenium is slower, no async.                                                                                  |
 | Body extraction | trafilatura         | Purpose-built for article/content extraction, handles diverse layouts. Raw BS4 requires manual nav/footer stripping.                                              |
 | Keywords        | YAKE                | Statistical (no model download), runs in microseconds, multilingual. KeyBERT is better quality but needs sentence-transformers (~400MB).                          |
+| HTML parsing    | Selectolax (lexbor)  | ~10-30x faster DOM queries than BS4. BS4+lxml fallback for strict-parse errors and tree mutation (extractor.py).                                                  |
 | Classification  | BART-MNLI zero-shot | Classifies into any labels at runtime without training data. No fixed taxonomy needed. Runs locally — no external API calls.                                      |
-| NER             | spaCy               | `en_core_web_lg` (~560MB, 685k GloVe vectors) — heavier than `sm` but far fewer false positives on capitalized common nouns in product/marketing text. transformers NER models are heavier with marginal benefit. |
 
 ## Project Structure
 
@@ -40,7 +39,7 @@ crawl_core/
 │   ├── js_renderer.py        # Playwright fallback for JS-heavy pages
 │   ├── parser.py             # extract metadata from HTML (BS4)
 │   ├── extractor.py          # extract clean body text (trafilatura)
-│   ├── classifier.py         # page type + topic classification + NER
+│   ├── classifier.py         # page type + topic classification
 │   └── schemas.py            # Pydantic request/response models
 ├── tests/
 │   ├── __init__.py
@@ -86,6 +85,8 @@ Content-Type: application/json
     "crawled_at": "ISO 8601",
     "render_method": "curl_cffi | playwright",
     "render_reason": "why this method was chosen",
+    "status_code": 200,
+    "content_length": 0,
     "metadata": {
         "title": "",
         "description": "",
@@ -108,7 +109,8 @@ Content-Type: application/json
         "structured_data": [],
         "headings": {
             "h1": [],
-            "h2": []
+            "h2": [],
+            "h3": []
         }
     },
     "content": {
@@ -120,13 +122,8 @@ Content-Type: application/json
         "page_type": "product_page | blog_post | news_article | landing_page | documentation | forum | other",
         "page_type_confidence": 0.0,
         "topics": [{ "topic": "", "relevance_score": 0.0 }],
+        "iab_categories": [""],
         "keywords": [""],
-        "entities": [
-            {
-                "text": "",
-                "label": "ORG | PERSON | GPE | MONEY | DATE | PRODUCT"
-            }
-        ],
         "summary": ""
     },
     "error": null
@@ -160,7 +157,7 @@ class CrawlResult:
 
 ### detector.py
 
-Analyzes raw HTML from `fetcher.py` to determine if the page is a JS-heavy skeleton needing Playwright. Returns a `FetchAnalysis` dataclass.
+Analyzes raw HTML from `fetcher.py` to determine if the page is a JS-heavy skeleton needing Playwright. Uses Selectolax (lexbor) as primary parser; falls back to BS4 + lxml on parse errors. Signature: `analyze(html: str, url: str) -> FetchAnalysis`.
 
 ```python
 @dataclass
@@ -174,7 +171,7 @@ class FetchAnalysis:
 
 1. **Body content length:** Extract visible text from `<body>` via `soup.body.get_text(strip=True)`. If length < `MIN_BODY_LENGTH` (200) chars → suspicious.
 2. **Content element count:** Count `<p>`, `<h1>`, `<h2>`, `<h3>`, `<article>`, `<section>` tags. If < `MIN_CONTENT_ELEMENTS` (5) → suspicious.
-3. **Script-to-content ratio:** Calculate `total_script_size / total_html_size`. If > `MAX_SCRIPT_RATIO` (0.5) → JS-heavy.
+3. **Script-to-content ratio:** Calculate `total_script_size / total_html_size`. If > `MAX_SCRIPT_RATIO` (0.5) OR script tag count >= `MIN_SCRIPT_TAG_COUNT` (15) → JS-heavy.
 4. **Skeleton markers:** Check for:
     - Empty root divs: `<div id="root"></div>`, `<div id="app"></div>`, `<div id="__next"></div>` with no text content inside
     - Loading indicators: body text starts with "Loading", "Please wait", "Enable JavaScript"
@@ -200,34 +197,36 @@ Playwright-based fallback for JS-heavy pages. Only called when `detector.py` ret
 **Browser lifecycle:**
 
 - Launch Chromium once during FastAPI lifespan startup. Store browser instance in `app.state.browser`.
-- Each request creates a new page (tab) from the shared browser — `browser.new_page()`. This avoids the ~2s browser launch cost per request.
-- Close the page after extracting HTML. Browser persists.
+- Each request creates an isolated browser context (`browser.new_context()`) with locale/timezone for stealth. A page is created inside the context.
+- `playwright-stealth` is applied to the context to disable Chromium automation detection signals (navigator.webdriver, etc.).
+- Close the context (which also closes its page) after extracting HTML. Browser persists.
 - Shutdown browser during FastAPI lifespan shutdown.
 
 **Page rendering logic:**
 
+- Apply stealth to context before navigation
 - Block unnecessary resources to speed up rendering, abort extensions (png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,mp4,mp3)
 - Extra wait for late-rendering SPAs (React hydration, etc.)
 
 ```python
 async def render_page(browser, url: str) -> str:
-    page = await browser.new_page()
+    context = await browser.new_context(
+        viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+        user_agent=JS_USER_AGENT,
+        locale="en-US",
+        timezone_id="America/New_York",
+    )
     try:
-        # Block unnecessary resources to speed up rendering
-        await page.route(
-            "**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,mp4,mp3}",
-            lambda route: route.abort()
-        )
+        page = await context.new_page()
+        await _stealth.apply_stealth_async(context)
+        await page.route(BLOCKED_RESOURCES, lambda route: route.abort())
+        await page.goto(url, wait_until="networkidle", timeout=JS_RENDER_TIMEOUT)
+        await page.wait_for_timeout(JS_EXTRA_WAIT)
 
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-
-        # Extra wait for late-rendering SPAs (React hydration, etc.)
-        await page.wait_for_timeout(2000)
-
-        html = await page.content()  # fully rendered DOM
+        html = await page.content()
         return html
     finally:
-        await page.close()
+        await context.close()
 ```
 
 **Key settings (all configurable in `config.py`):**
@@ -246,9 +245,10 @@ async def render_page(browser, url: str) -> str:
 
 ### parser.py
 
-Extracts all metadata fields from HTML using BeautifulSoup.
+Extracts all metadata fields from HTML. Uses Selectolax (lexbor) as primary parser; falls back to BeautifulSoup4 + lxml on parse errors.
 
-- Parse with `BeautifulSoup(html, "lxml")`.
+- Primary: `LexborHTMLParser(html)` → `tree.css_first()` / `tree.css()` / `tag.attributes.get()`
+- Fallback: `BeautifulSoup(html, "lxml")` → `soup.find()` / `soup.find_all()` / `tag.get()`
 - **title:** `soup.find("title").get_text(strip=True)`
 - **description:** `soup.find("meta", {"name": "description"})["content"]`
 - **canonical_url:** `soup.find("link", {"rel": "canonical"})["href"]`
@@ -257,12 +257,12 @@ Extracts all metadata fields from HTML using BeautifulSoup.
 - **open_graph:** Find all `<meta property="og:*">` tags. Extract property name and content.
 - **twitter_card:** Find all `<meta name="twitter:*">` tags. Extract name and content.
 - **structured_data:** Find all `<script type="application/ld+json">` tags. Parse each as JSON. Return as list. Handle malformed JSON gracefully (skip, don't crash).
-- **headings:** Extract text from all `<h1>` and `<h2>` tags. Return as lists.
+- **headings:** Extract text from all `<h1>`, `<h2>`, and `<h3>` tags. Return as lists.
 - **All fields must handle missing/malformed tags gracefully.** Return `None` for missing fields, never raise exceptions.
 
 ### extractor.py
 
-Extracts clean body text from HTML. Three-stage pipeline: prune → extract → fallback.
+Extracts clean body text from HTML. Signature: `extract(html: str, url: str) -> ContentResponse`. Three-stage pipeline: prune → extract → fallback.
 
 **1. HTML pruning (`_prune_html`)** — DOM cleanup before extraction:
 
@@ -297,9 +297,9 @@ trafilatura.extract(
 
 ### classifier.py
 
-Runs three independent classification layers. All models loaded once at startup. Signature: `classify(body_text, models, metadata=None)`.
+Runs two independent classification layers. All models loaded once at startup. Signature: `async def classify(body_text: str, models: dict, metadata=None, executor=None) -> ClassificationResponse`. Uses `executor` (ThreadPoolExecutor) to run BART-MNLI inference off the event loop.
 
-**Metadata-aware input:** When `metadata` is provided, BART-MNLI receives composite text: `title | description\nbody_text` (metadata prefix capped at `METADATA_PREFIX_BUDGET=200` chars, word-boundary truncated). This gives BART strong page-type signals (e.g., "Amazon.com" in title → product page). YAKE and spaCy still receive raw `body_text` — YAKE benefits from longer statistical text, and prepending capitalized titles would create more NER false positives.
+**Metadata-aware input:** When `metadata` is provided, BART-MNLI receives composite text: `title\nh1\ndescription\nbody_text`, truncated to `BODY_TEXT_LIMIT` (2800 chars). Duplicate metadata is skipped via overlap detection (`_text_overlap >= 0.8`). No separate prefix budget — at 2800 chars total, metadata (typically ~200-300 chars) never starves body text. YAKE receives raw `body_text` — benefits from longer statistical text without metadata noise.
 
 **1. Keywords (YAKE) — statistical, no model:**
 
@@ -319,54 +319,34 @@ How it works internally: BART-MNLI is an NLI (Natural Language Inference) model.
 classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 
 # classifier_text = _build_classifier_text(body_text, metadata)
-# Prepends "title | description\n" to body_text (metadata capped at 200 chars)
+# Prepends "title\nh1\ndescription\n" to body_text, truncated to BODY_TEXT_LIMIT (2800 chars)
 
-# Page type — single label
+# Page type — single label (skipped if JSON-LD @type resolves via SCHEMA_TYPE_TO_PAGE_TYPE)
 page_type_result = classifier(
-    classifier_text[:512],  # truncate to keep inference fast
+    classifier_text[:BODY_TEXT_LIMIT],
     candidate_labels=["product page", "blog post", "news article",
                       "landing page", "documentation", "forum discussion", "other"],
     hypothesis_template="This is a {}."
 )
 # Return: top label + its score as confidence
 
-# Topics — multi label
+# Topics — multi label, using IAB Content Taxonomy Tier 1 labels
 topic_result = classifier(
-    classifier_text[:512],
-    candidate_labels=["technology", "business", "health", "science", "sports",
-                      "entertainment", "politics", "education", "food & cooking",
-                      "travel", "fashion", "finance", "real estate", "automotive",
-                      "home & garden", "outdoor recreation", "electronics",
-                      "software", "artificial intelligence", "e-commerce"],
+    classifier_text[:BODY_TEXT_LIMIT],
+    candidate_labels=IAB_TIER1_LABELS,  # 23 industry-standard categories
     hypothesis_template="This text is about {}.",
     multi_label=True
 )
-# Return: all labels with score > 0.3, sorted by score descending
+# Return: all labels with score > TOPIC_THRESHOLD (0.75), sorted by score descending
 ```
 
-**3. Entities (spaCy NER):**
+**3. Summary (template-based, no LLM):**
 
 ```python
-nlp = spacy.load("en_core_web_lg")
-doc = nlp(body_text[:10000])  # cap input length for performance
-entities = [{"text": ent.text, "label": ent.label_}
-            for ent in doc.ents
-            if ent.label_ in {"ORG", "PERSON", "GPE", "MONEY", "DATE", "PRODUCT"}]
-# Deduplicate by (text, label) tuple
+summary = f"A {page_type} about {', '.join(top_3_topics)}."
 ```
 
-**Entity post-processing filters** (applied after spaCy extraction, before dedup):
-1. **Newline filter** — skip entities containing `\n` (parsing artifacts like "Bagel Function\nBagel Setting")
-2. **Length + format** — skip entities <2 or >80 chars; skip ALL-CAPS entities ≤4 chars
-3. **Document lowercase PERSON filter** — build set of all lowercase words from doc. For each PERSON entity, if ALL alpha tokens appear lowercase elsewhere in the doc → skip. Catches capitalized common nouns ("Crumb Tray", "Frozen Pancakes") while keeping real names ("Cuisinart" never appears lowercase).
-
-**4. Summary (template-based, no LLM):**
-
-```python
-summary = f"A {page_type} about {', '.join(top_3_topics)}, featuring {', '.join(top_3_entity_texts)}."
-```
-
-**Model loading:** All models load once during FastAPI lifespan startup. Store in `app.state`. Never reload per request. BART-MNLI is ~1.6GB, spaCy `en_core_web_lg` is ~560MB.
+**Model loading:** All models load once during FastAPI lifespan startup. Store in `app.state`. Never reload per request. BART-MNLI is ~1.6GB.
 
 ### schemas.py
 
@@ -376,9 +356,11 @@ Pydantic models for request/response validation.
 - `CrawlResponse`: matches full response JSON schema above
     - `render_method`: `Literal["curl_cffi", "playwright"]`
     - `render_reason`: `str`
+    - `status_code`: `int`
+    - `content_length`: `int`
     - All optional metadata fields: `Optional[str] = None`
     - `metadata`, `content`, `classification`: nested Pydantic models, all `Optional` at top level (null when status is error)
-- `MetadataResponse`, `OpenGraphResponse`, `TwitterCardResponse`, `ContentResponse`, `ClassificationResponse`, `TopicScore`, `Entity`: nested models
+- `MetadataResponse`, `OpenGraphResponse`, `TwitterCardResponse`, `ContentResponse`, `ClassificationResponse`, `TopicScore`: nested models
 
 ### main.py
 
@@ -401,7 +383,7 @@ POST /crawl { url }
   │
   ├─ 1. fetcher.fetch(url)               → CrawlResult (HTML + resolved_url)     ~200ms
   │
-  ├─ 2. detector.analyze(html)           → FetchAnalysis
+  ├─ 2. detector.analyze(html, url)      → FetchAnalysis
   │      │
   │      ├── needs_js_render=False        → use curl_cffi HTML as-is
   │      │
@@ -418,12 +400,11 @@ POST /crawl { url }
   │
   ├─ 4. extractor.extract(final_html)    → body_text + word_count
   │
-  ├─ 5. classifier.classify(body_text, models, metadata)
+  ├─ 5. await classifier.classify(body_text, models, metadata, executor)
   │      ├── YAKE keywords (body_text)   → top 10 keywords                        ~5ms
   │      ├── BART-MNLI page_type         → label + confidence                     ~400ms
-  │      │   (metadata prefix + body_text, truncated to 512 chars)
-  │      ├── BART-MNLI topics            → ranked topic list                      ~400ms
-  │      └── spaCy NER (body_text)       → entities (with post-filters)           ~50ms
+  │      │   (metadata prefix + body_text, truncated to BODY_TEXT_LIMIT chars)
+  │      └── BART-MNLI topics            → ranked topic list                      ~400ms
   │
   └─ 6. Assemble CrawlResponse           → return JSON
 ```
@@ -441,11 +422,11 @@ POST /crawl { url }
 - No third-party crawling/classification **services** (Diffbot, ScrapingBee, import.io, etc.).
 - Third-party **libraries** are allowed and encouraged.
 - Models must load once at startup, not per request.
-- Playwright browser must launch once at startup, not per request. Each request creates a new page (tab).
+- Playwright browser must launch once at startup, not per request. Each request creates a new browser context (for stealth isolation) with a page inside it.
 - All extraction must handle malformed/missing HTML without crashing.
 - Playwright is a **fallback only** — never the default path. curl_cffi is always attempted first.
 - Playwright page timeout: 30s max. If it times out, return partial results from curl_cffi HTML with a warning in the error field.
-- Composite text (metadata prefix + body_text) sent to BART-MNLI is truncated to 512 chars. Metadata prefix budget is 200 chars (`METADATA_PREFIX_BUDGET` in `classifier.py`). Body text sent to spaCy is capped at 10,000 characters.
+- Composite text (metadata prefix + body_text) sent to BART-MNLI is truncated to `BODY_TEXT_LIMIT` (2800 chars, in `config.py`). BART's tokenizer auto-truncates at 1024 tokens internally; 2800 chars gives the model more context while staying within that window.
 
 ---
 
@@ -475,25 +456,27 @@ https://www.cnn.com/2025/09/23/tech/google-study-90-percent-tech-jobs-ai
 fastapi>=0.110.0
 uvicorn>=0.29.0
 curl_cffi>=0.7.0
+selectolax>=0.3.21
 beautifulsoup4>=4.12.0
 lxml>=5.1.0
 trafilatura>=1.8.0
 yake>=0.4.8
 transformers>=4.40.0
 torch>=2.2.0
-spacy>=3.7.0
 psutil>=5.9.0
 pydantic>=2.6.0
 python-dotenv>=1.0.0
 playwright>=1.42.0
+playwright-stealth>=2.0.0
+spacy>=3.7.0
 ```
 
 Post-install:
 
 ```bash
-python -m spacy download en_core_web_lg
 playwright install chromium
 playwright install-deps chromium
+python -m spacy download en_core_web_sm
 ```
 
 ---
@@ -516,9 +499,9 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install browser and NLP model
+# Install browser and spaCy model
 RUN playwright install chromium
-RUN python -m spacy download en_core_web_lg
+RUN python -m spacy download en_core_web_sm
 
 # Copy application code
 COPY ./app ./app
@@ -527,7 +510,7 @@ EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-**Memory:** Playwright Chromium ~200MB + BART-MNLI ~1.6GB + spaCy ~560MB + Python runtime ~200MB = **~3GB minimum, 4GB recommended**.
+**Memory:** Playwright Chromium ~200MB + BART-MNLI ~1.6GB + Python runtime ~200MB = **~2GB minimum, 3GB recommended**.
 
 **Image size:** ~3-5GB (Python + PyTorch + Chromium). For production, consider multi-stage build to reduce.
 
@@ -538,6 +521,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 All heavy resources load once at startup and tear down at shutdown:
 
 ```python
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from playwright.async_api import async_playwright
@@ -553,19 +537,23 @@ async def lifespan(app: FastAPI):
         "zero-shot-classification",
         model="facebook/bart-large-mnli"
     )
-    app.state.nlp = spacy.load("en_core_web_lg")
     app.state.kw_extractor = yake.KeywordExtractor(lan="en", n=2, top=10)
+    app.state.nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat"])
 
-    # 2. Launch Playwright browser (single instance, shared across requests)
+    # 2. Thread pool for blocking model inference
+    app.state.model_executor = ThreadPoolExecutor(max_workers=1)
+
+    # 3. Launch Playwright browser (single instance, shared across requests)
     app.state.playwright = await async_playwright().start()
     app.state.browser = await app.state.playwright.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage"]  # needed in Docker
+        args=["--no-sandbox", "--disable-dev-shm-usage"]
     )
 
     yield
 
     # ── Shutdown ──
+    app.state.model_executor.shutdown(wait=False)
     await app.state.browser.close()
     await app.state.playwright.stop()
 
