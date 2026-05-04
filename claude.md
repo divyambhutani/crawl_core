@@ -32,22 +32,23 @@ A FastAPI service that takes a single URL, crawls the page, extracts HTML metada
 crawl_core/
 ├── app/
 │   ├── __init__.py
-│   ├── config.py             # all constants and thresholds (no .env, pure Python)
-│   ├── main.py              # FastAPI app, /crawl endpoint, lifespan management
-│   ├── fetcher.py            # fetch URL via curl_cffi (primary)
-│   ├── detector.py           # analyze HTML to detect JS-heavy skeleton pages
-│   ├── js_renderer.py        # Playwright fallback for JS-heavy pages
-│   ├── parser.py             # extract metadata from HTML (BS4)
-│   ├── extractor.py          # extract clean body text (trafilatura)
-│   ├── classifier.py         # page type + topic classification
-│   └── schemas.py            # Pydantic request/response models
-├── tests/
-│   ├── __init__.py
-│   ├── test_fetcher.py
-│   ├── test_detector.py
-│   ├── test_parser.py
-│   ├── test_extractor.py
-│   └── test_classifier.py
+│   ├── main.py              # FastAPI app, routes (~30 lines)
+│   ├── lifespan.py          # startup/shutdown, model loading
+│   ├── pipeline.py          # crawl orchestration, latency tracking
+│   ├── config.py            # all constants and thresholds (no .env, pure Python)
+│   ├── schemas.py           # Pydantic request/response models
+│   ├── fetch/
+│   │   ├── __init__.py      # re-exports: fetch, analyze, render_page
+│   │   ├── fetcher.py       # fetch URL via curl_cffi (primary)
+│   │   ├── detector.py      # analyze HTML to detect JS-heavy skeleton pages
+│   │   └── renderer.py      # Playwright fallback for JS-heavy pages
+│   ├── parse/
+│   │   ├── __init__.py      # re-exports: parse, extract
+│   │   ├── parser.py        # extract metadata from HTML (selectolax + BS4 fallback)
+│   │   └── extractor.py     # extract clean body text (trafilatura)
+│   └── classify/
+│       ├── __init__.py      # re-exports: classify
+│       └── classifier.py    # page type + topic classification
 ├── requirements.txt
 ├── Dockerfile
 ├── .env.example
