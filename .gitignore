@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .env
 claude.local.md
+
+test_curls.txt

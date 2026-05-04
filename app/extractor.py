@@ -23,9 +23,11 @@ def extract(html: str, url: str) -> ContentResponse:
     logger.info("starting extraction | url=%s html_length=%d", url, len(html))
 
     pruned = _prune_html(html, url)
+    method = "trafilatura"
     body_text = _extract_trafilatura(pruned, url)
 
     if not body_text:
+        method = "bs4_fallback"
         logger.warning("trafilatura returned empty, falling back to bs4 | url=%s", url)
         body_text = _extract_bs4_fallback(pruned, url)
 
@@ -38,8 +40,7 @@ def extract(html: str, url: str) -> ContentResponse:
 
     logger.info(
         "extraction complete | url=%s word_count=%d reading_time=%.1f method=%s",
-        url, word_count, reading_time,
-        "trafilatura" if body_text else "bs4_fallback",
+        url, word_count, reading_time, method,
     )
 
     return ContentResponse(
@@ -56,14 +57,14 @@ def _prune_html(html: str, url: str) -> str:
         main = soup.find("main") or soup.find(attrs={"role": "main"}) or soup.find("article")
         if main and len(main.get_text(strip=True)) > 200:
             head = soup.find("head")
-            pruned = BeautifulSoup("<html></html>", "lxml")
-            html_tag = pruned.find("html")
+            narrowed = BeautifulSoup("<html></html>", "lxml")
+            html_tag = narrowed.find("html")
             if head and html_tag:
                 html_tag.append(head.extract())
             if html_tag:
                 html_tag.append(main.extract())
             logger.info("narrowed to <%s> container | url=%s", main.name, url)
-            return str(pruned)
+            soup = narrowed
 
         for tag_name in PRUNE_TAGS:
             for tag in soup.find_all(tag_name):

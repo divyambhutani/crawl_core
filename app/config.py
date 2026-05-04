@@ -2,20 +2,27 @@
 REQUEST_TIMEOUT = 15
 MAX_REDIRECTS = 5
 IMPERSONATE = "chrome120"
+FETCH_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 # ── Extractor ──
 READING_SPEED_WPM = 200
 
 PRUNE_SELECTORS = [
-    # User-generated content
     ".reviews", ".review", ".comments", ".comment", ".ratings",
     "[data-component='reviews']", "[data-hook='review']",
-    # Cross-sell / related
     ".related-products", ".recommendations", ".a-carousel",
-    # Boilerplate
     ".cookie-banner", ".newsletter-signup",
     "[role='complementary']",
-    # Navigation noise
     ".breadcrumb", ".pagination",
 ]
 
@@ -48,6 +55,7 @@ TOP_K_KEYWORDS = 10
 MIN_BODY_LENGTH = 200
 MIN_CONTENT_ELEMENTS = 5
 MAX_SCRIPT_RATIO = 0.5
+MIN_SCRIPT_TAG_COUNT = 15
 
 # ── JS Renderer ──
 JS_RENDER_TIMEOUT = 30000

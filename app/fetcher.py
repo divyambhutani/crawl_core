@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from curl_cffi.requests import AsyncSession, exceptions
 
-from app.config import IMPERSONATE, MAX_REDIRECTS, REQUEST_TIMEOUT
+from app.config import FETCH_HEADERS, IMPERSONATE, MAX_REDIRECTS, REQUEST_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ async def fetch(url: str) -> CrawlResult:
             logger.info("request sent, awaiting response | url=%s", url)
             response = await session.get(
                 url,
+                headers=FETCH_HEADERS,
                 impersonate=IMPERSONATE,
                 timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,

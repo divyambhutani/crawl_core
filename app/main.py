@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import psutil
-
 import spacy
+
 import yake
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,14 +47,14 @@ async def lifespan(app: FastAPI):
 
     t0 = time.perf_counter()
     rss0 = _get_rss_mb()
-    app.state.nlp = spacy.load("en_core_web_lg")
-    logger.info("loaded spacy-en | time=%.2fs mem=+%.0fMB",
+    app.state.kw_extractor = yake.KeywordExtractor(lan="en", n=2, top=10)
+    logger.info("loaded yake | time=%.2fs mem=+%.0fMB",
                 time.perf_counter() - t0, _get_rss_mb() - rss0)
 
     t0 = time.perf_counter()
     rss0 = _get_rss_mb()
-    app.state.kw_extractor = yake.KeywordExtractor(lan="en", n=2, top=10)
-    logger.info("loaded yake | time=%.2fs mem=+%.0fMB",
+    app.state.nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat"])
+    logger.info("loaded spacy en_core_web_sm | time=%.2fs mem=+%.0fMB",
                 time.perf_counter() - t0, _get_rss_mb() - rss0)
 
     t0 = time.perf_counter()
@@ -62,6 +63,9 @@ async def lifespan(app: FastAPI):
     logger.info("loaded playwright-engine | time=%.2fs mem=+%.0fMB",
                 time.perf_counter() - t0, _get_rss_mb() - rss0)
 
+    app.state.model_executor = ThreadPoolExecutor(max_workers=1)
+    logger.info("created model_executor | max_workers=1")
+
     t0 = time.perf_counter()
     rss0 = _get_rss_mb()
     app.state.browser = await app.state.playwright.chromium.launch(
@@ -69,7 +73,14 @@ async def lifespan(app: FastAPI):
         handle_sigint=False,
         handle_sigterm=False,
         handle_sighup=False,
-        args=["--no-sandbox", "--disable-dev-shm-usage"])
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--no-first-run",
+            "--disable-sync",
+        ])
     logger.info("loaded chromium-browser | time=%.2fs mem=+%.0fMB",
                 time.perf_counter() - t0, _get_rss_mb() - rss0)
 
@@ -82,6 +93,9 @@ async def lifespan(app: FastAPI):
 
     shutdown_start = time.perf_counter()
     logger.info("=== shutdown begin ===")
+
+    app.state.model_executor.shutdown(wait=False)
+    logger.info("shut down model_executor")
 
     t0 = time.perf_counter()
     try:
@@ -111,9 +125,6 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[
                    "*"], allow_methods=["*"], allow_headers=["*"])
 
-# health check for crawlers
-
-
 @app.get("/health")
 async def health(request: Request) -> dict:
     models_loaded = all(hasattr(request.app.state, attr)
@@ -127,20 +138,26 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
     logger.info("POST /crawl received | url=%s", url)
 
     try:
+        timings = {}
+
+        t0 = time.perf_counter()
         result = await fetch(url)
+        timings["fetch"] = time.perf_counter() - t0
 
         status = "success" if result.error is None else "error"
-        logger.info("crawl complete | status=%s url=%s", status, url)
 
         render_method = "curl_cffi"
         render_reason = "default fetch via curl_cffi"
         render_error = None
+        classification_error = None
         metadata = None
         content = None
         classification = None
 
         if result.error is None:
+            t0 = time.perf_counter()
             analysis = analyze(result.html, result.resolved_url)
+            timings["detect"] = time.perf_counter() - t0
             html_for_parse = result.html
             html_for_extract = result.html
 
@@ -155,7 +172,9 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
                     render_method = "playwright"
                     render_reason = analysis.reason
                     try:
+                        t0 = time.perf_counter()
                         rendered_html = await render_page(browser, result.resolved_url)
+                        timings["render"] = time.perf_counter() - t0
                         if analysis.meta_available:
                             html_for_extract = rendered_html
                         else:
@@ -178,23 +197,40 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
 
             loop = asyncio.get_running_loop()
 
-            logger.info("starting parse + extract (parallel) | url=%s", url)
+            t0 = time.perf_counter()
             metadata, content = await asyncio.gather(
                 loop.run_in_executor(
                     None, parse, html_for_parse, result.resolved_url),
                 loop.run_in_executor(
                     None, extract, html_for_extract, result.resolved_url),
             )
-            logger.info("parse + extract complete | url=%s", url)
+            timings["parse+extract"] = time.perf_counter() - t0
 
-            classification = None
             if content and content.body_text:
-                models = {
-                    "classifier": request.app.state.classifier,
-                    "nlp": request.app.state.nlp,
-                    "kw_extractor": request.app.state.kw_extractor,
-                }
-                classification = await classify(content.body_text, models, metadata)
+                try:
+                    models = {
+                        "classifier": request.app.state.classifier,
+                        "kw_extractor": request.app.state.kw_extractor,
+                        "nlp": request.app.state.nlp,
+                    }
+                    t0 = time.perf_counter()
+                    classification = await classify(
+                        content.body_text, models, metadata,
+                        executor=request.app.state.model_executor,
+                    )
+                    timings["classify"] = time.perf_counter() - t0
+                except Exception as exc:
+                    classification_error = f"classification failed: {exc}"
+                    logger.warning(
+                        "classification failed, returning partial results | url=%s error=%s",
+                        url, exc,
+                    )
+            else:
+                classification_error = "classification skipped: no body text extracted"
+
+        parts = [f"{k}={v*1000:.0f}ms" for k, v in timings.items()]
+        total = sum(timings.values())
+        logger.info("latency | total=%dms %s | url=%s", total * 1000, " ".join(parts), url)
 
         return CrawlResponse(
             status=status,
@@ -208,7 +244,7 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
             metadata=metadata,
             content=content,
             classification=classification,
-            error=render_error or result.error,
+            error="; ".join(filter(None, [render_error, classification_error, result.error])) or None,
         )
 
     except Exception as exc:
@@ -222,20 +258,3 @@ async def crawl(body: CrawlRequest, request: Request) -> CrawlResponse:
             content_length=0,
             error=str(exc),
         )
-
-
-# curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "https://www.cnn.com/2025/09/23/tech/google-study-90-percent-tech-jobs-ai"}'
-
-# curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "http://www.amazon.com/Cuisinart-CPT-122-Compact-2-Slice-Toaster/dp/B009GQ034C/ref=sr_1_1?s=kitchen&ie=UTF8&qid=1431620315&sr=1-1&keywords=toaster"}'
-
-# curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "http://blog.rei.com/camp/how-to-introduce-your-indoorsy-friend-to-the-outdoors/"}'
-
-# curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "https://www.myntra.com/handbags/caprese/caprese-colourblocked-structured-sling-bag/35480213/buy"}'
-
-
-# curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "https://www.shopmygear.com/products/gear-bravo-16-25l-medium-water-resistant-school-bag-casual-backpack-daypack-travel-backpack-kids-bag-for-boys-girls-blue-cream-copy?variant=51512016273725&country=IN&currency=INR&utm_medium=product_sync&utm_source=google&utm_content=sag_organic&utm_campaign=sag_organic&utm_source=google_ads&utm_medium=cpc&utm_campaign=ADB_Pmax_Feed_Only_All_Products_04082025&gad_source=1&gad_campaignid=22868092978&gbraid=0AAAABAKw6MCC-B8fLNUY75LlFhn5P5ubR&gclid=CjwKCAjwntHPBhAaEiwA_Xp6RquumbL85cIqi38B_hL5_gqlq-J1Kkq5feJbgnlSXh69L_ARU6KlthoCJ8IQAvD_BwE"}'
-
-
-# curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "https://www.nike.in/nike-downshifter-14-men-s-road-running-shoe/p/24928858"}'
-
-# curl -X POST localhost:8000/crawl -H "Content-Type: application/json" -d '{"url": "https://www.airbnb.co.in/rooms/985240485996289865?check_in=2026-05-08&check_out=2026-05-10&photo_id=1744922689&source_impression_id=p3_1777804742_P3Q59jRkTBhOn8-3&previous_page_section_name=1000"}'
