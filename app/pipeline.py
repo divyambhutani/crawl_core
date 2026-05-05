@@ -18,7 +18,7 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
         timings = {}
 
         t0 = time.perf_counter()
-        result = await fetch(url)
+        result = await fetch(url, app_state.http_session)
         timings["fetch"] = time.perf_counter() - t0
 
         status = "success" if result.error is None else "error"

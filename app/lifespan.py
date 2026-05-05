@@ -4,13 +4,15 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import psutil
-import spacy
-import yake
 from fastapi import FastAPI
 from playwright.async_api import async_playwright
-from transformers import pipeline as hf_pipeline
 
-from app.config import LOG_FORMAT, LOG_LEVEL
+from curl_cffi.requests import AsyncSession
+
+from app.config import (
+    CLASSIFIER_BACKEND, FETCH_HEADERS, IMPERSONATE, LOG_FORMAT, LOG_LEVEL,
+    MAX_REDIRECTS, REQUEST_TIMEOUT,
+)
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
@@ -26,23 +28,48 @@ async def lifespan(app: FastAPI):
     startup_rss = _get_rss_mb()
     logger.info("=== startup begin ===")
 
-    t0 = time.perf_counter()
-    rss0 = _get_rss_mb()
-    app.state.classifier = hf_pipeline(
-        "zero-shot-classification", model="facebook/bart-large-mnli")
-    logger.info("loaded bart-mnli | time=%.2fs mem=+%.0fMB",
-                time.perf_counter() - t0, _get_rss_mb() - rss0)
+    if CLASSIFIER_BACKEND == "local":
+        from transformers import pipeline as hf_pipeline
+        t0 = time.perf_counter()
+        rss0 = _get_rss_mb()
+        app.state.classifier = hf_pipeline(
+            "zero-shot-classification", model="facebook/bart-large-mnli")
+        logger.info("loaded bart-mnli | time=%.2fs mem=+%.0fMB",
+                    time.perf_counter() - t0, _get_rss_mb() - rss0)
+    else:
+        app.state.classifier = None
+        logger.info("skipped bart-mnli (backend=%s)", CLASSIFIER_BACKEND)
+
+    if CLASSIFIER_BACKEND == "local":
+        import spacy
+        import yake
+
+        t0 = time.perf_counter()
+        rss0 = _get_rss_mb()
+        app.state.kw_extractor = yake.KeywordExtractor(lan="en", n=2, top=10)
+        logger.info("loaded yake | time=%.2fs mem=+%.0fMB",
+                    time.perf_counter() - t0, _get_rss_mb() - rss0)
+
+        t0 = time.perf_counter()
+        rss0 = _get_rss_mb()
+        app.state.nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat"])
+        logger.info("loaded spacy en_core_web_sm | time=%.2fs mem=+%.0fMB",
+                    time.perf_counter() - t0, _get_rss_mb() - rss0)
+    else:
+        app.state.kw_extractor = None
+        app.state.nlp = None
+        logger.info("skipped yake/spacy (backend=%s)", CLASSIFIER_BACKEND)
 
     t0 = time.perf_counter()
     rss0 = _get_rss_mb()
-    app.state.kw_extractor = yake.KeywordExtractor(lan="en", n=2, top=10)
-    logger.info("loaded yake | time=%.2fs mem=+%.0fMB",
-                time.perf_counter() - t0, _get_rss_mb() - rss0)
-
-    t0 = time.perf_counter()
-    rss0 = _get_rss_mb()
-    app.state.nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat"])
-    logger.info("loaded spacy en_core_web_sm | time=%.2fs mem=+%.0fMB",
+    app.state.http_session = AsyncSession(
+        headers=FETCH_HEADERS,
+        impersonate=IMPERSONATE,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+        max_redirects=MAX_REDIRECTS,
+    )
+    logger.info("created http_session | time=%.2fs mem=+%.0fMB",
                 time.perf_counter() - t0, _get_rss_mb() - rss0)
 
     t0 = time.perf_counter()
@@ -51,8 +78,12 @@ async def lifespan(app: FastAPI):
     logger.info("loaded playwright-engine | time=%.2fs mem=+%.0fMB",
                 time.perf_counter() - t0, _get_rss_mb() - rss0)
 
-    app.state.model_executor = ThreadPoolExecutor(max_workers=1)
-    logger.info("created model_executor | max_workers=1")
+    if CLASSIFIER_BACKEND == "local":
+        app.state.model_executor = ThreadPoolExecutor(max_workers=1)
+        logger.info("created model_executor | max_workers=1")
+    else:
+        app.state.model_executor = None
+        logger.info("skipped model_executor (backend=%s)", CLASSIFIER_BACKEND)
 
     t0 = time.perf_counter()
     rss0 = _get_rss_mb()
@@ -82,8 +113,9 @@ async def lifespan(app: FastAPI):
     shutdown_start = time.perf_counter()
     logger.info("=== shutdown begin ===")
 
-    app.state.model_executor.shutdown(wait=False)
-    logger.info("shut down model_executor")
+    if app.state.model_executor:
+        app.state.model_executor.shutdown(wait=False)
+        logger.info("shut down model_executor")
 
     t0 = time.perf_counter()
     try:
@@ -96,6 +128,13 @@ async def lifespan(app: FastAPI):
                 "chromium-browser already terminated | time=%.2fs", time.perf_counter() - t0)
     except Exception as exc:
         logger.warning("chromium-browser close failed | error=%s", exc)
+
+    t0 = time.perf_counter()
+    try:
+        await app.state.http_session.close()
+        logger.info("closed http_session | time=%.2fs", time.perf_counter() - t0)
+    except Exception as exc:
+        logger.warning("http_session close failed | error=%s", exc)
 
     t0 = time.perf_counter()
     try:

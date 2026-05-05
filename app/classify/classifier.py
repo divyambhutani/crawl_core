@@ -1,53 +1,21 @@
 import asyncio
+import json
 import logging
+import os
 import re
+import threading
 
-from app.config import BODY_TEXT_LIMIT, TOP_K_KEYWORDS, TOPIC_THRESHOLD
+from app.classify.types import (
+    IAB_TIER1_LABELS, PAGE_LEVEL_TYPES, PAGE_TYPE_LABELS,
+    SCHEMA_TYPE_TO_PAGE_TYPE,
+)
+from app.config import (
+    BODY_TEXT_LIMIT, CLASSIFIER_BACKEND, GEMINI_MODEL, GEMINI_TIMEOUT,
+    TOP_K_KEYWORDS, TOPIC_THRESHOLD,
+)
 from app.schemas import ClassificationResponse, MetadataResponse, TopicScore
 
 logger = logging.getLogger(__name__)
-
-PAGE_TYPE_LABELS = [
-    "product page", "blog post", "news article",
-    "landing page", "documentation", "forum discussion", "other",
-]
-
-IAB_TIER1_LABELS = [
-    "Arts & Entertainment", "Automotive", "Business & Finance",
-    "Careers", "Education", "Family & Parenting",
-    "Food & Drink", "Health & Fitness", "Hobbies & Interests",
-    "Home & Garden", "Law, Government & Politics", "News",
-    "Personal Finance", "Pets", "Real Estate",
-    "Religion & Spirituality", "Science", "Shopping",
-    "Society", "Sports", "Style & Fashion",
-    "Technology & Computing", "Travel",
-]
-
-SCHEMA_TYPE_TO_PAGE_TYPE: dict[str, tuple[str, float] | None] = {
-    "Product": ("product page", 1.0),
-    "IndividualProduct": ("product page", 1.0),
-    "ProductGroup": ("product page", 1.0),
-    "ItemPage": ("product page", 0.9),
-    "BlogPosting": ("blog post", 0.95),
-    "LiveBlogPosting": ("blog post", 0.95),
-    "Article": ("blog post", 0.9),
-    "Recipe": ("blog post", 0.9),
-    "NewsArticle": ("news article", 0.95),
-    "ReportageNewsArticle": ("news article", 0.95),
-    "TechArticle": ("documentation", 0.95),
-    "HowTo": ("documentation", 0.9),
-    "FAQPage": ("documentation", 0.9),
-    "APIReference": ("documentation", 0.95),
-    "DiscussionForumPosting": ("forum discussion", 0.95),
-    "QAPage": ("forum discussion", 0.9),
-    "Question": ("forum discussion", 0.9),
-    "CollectionPage": ("landing page", 0.85),
-    "SearchResultsPage": ("landing page", 0.85),
-    "WebPage": None,
-    "WebSite": None,
-    "Corporation": None,
-    "Organization": None,
-}
 
 _TITLE_SUFFIX_RE = re.compile(r"\s*[|–—\-]\s*[^|–—\-]{3,30}$")
 _TITLE_SPLIT_RE = re.compile(r"\s*[|–—]\s*")
@@ -68,12 +36,6 @@ def _flatten_structured_data(raw: list) -> list[dict]:
             result.extend(_flatten_structured_data(item))
     return result
 
-
-PAGE_LEVEL_TYPES = {
-    "BlogPosting", "LiveBlogPosting", "Article", "NewsArticle",
-    "ReportageNewsArticle", "TechArticle", "Recipe", "HowTo", "FAQPage",
-    "APIReference", "DiscussionForumPosting", "QAPage", "Question",
-}
 
 
 def _resolve_page_type_from_structured_data(
@@ -145,6 +107,105 @@ def _build_classifier_text(body_text: str, metadata: MetadataResponse | None) ->
     return combined[:BODY_TEXT_LIMIT]
 
 
+# ── Gemini Flash backend ──
+
+_GEMINI_PROMPT_TEMPLATE = """\
+Classify this web page text.
+
+PAGE TYPES (pick exactly one):
+product page, blog post, news article, landing page, documentation, forum discussion, other
+
+TOPIC CATEGORIES (score each 0.0-1.0, only include if >= 0.75):
+Arts & Entertainment, Automotive, Business & Finance, Careers, Education, \
+Family & Parenting, Food & Drink, Health & Fitness, Hobbies & Interests, \
+Home & Garden, Law, Government & Politics, News, Personal Finance, Pets, \
+Real Estate, Religion & Spirituality, Science, Shopping, Society, Sports, \
+Style & Fashion, Technology & Computing, Travel
+
+KEYWORDS: Extract up to 10 keywords/phrases that best describe the page content. Rank by relevance.
+
+SUMMARY: Write one descriptive sentence summarizing what this page is about.
+
+Return JSON only:
+{{"page_type": "...", "page_type_confidence": 0.95, "topics": [{{"topic": "...", "relevance_score": 0.85}}], "keywords": ["keyword1", "keyword2"], "summary": "One descriptive sentence."}}
+
+TEXT:
+{text}"""
+
+_gemini_client = None
+_gemini_lock = threading.Lock()
+
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        with _gemini_lock:
+            if _gemini_client is None:
+                from google import genai
+                _gemini_client = genai.Client(
+                    vertexai=True,
+                    project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+                    location=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
+                )
+    return _gemini_client
+
+
+async def _classify_via_gemini(
+    text: str,
+    sd_page_type: tuple[str, float] | None,
+) -> tuple[str, float, list[TopicScore], list[str], str]:
+    try:
+        from google.genai import types
+
+        client = _get_gemini_client()
+        prompt = _GEMINI_PROMPT_TEMPLATE.format(text=text)
+
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0,
+                ),
+            ),
+            timeout=GEMINI_TIMEOUT,
+        )
+
+        if not response.text:
+            raise ValueError("Gemini returned empty response")
+        result = json.loads(response.text)
+
+        if sd_page_type:
+            page_type, confidence = sd_page_type
+        else:
+            page_type = result.get("page_type", "other")
+            confidence = result.get("page_type_confidence", 0.0)
+
+        raw_topics = result.get("topics", [])
+        topics = [
+            TopicScore(
+                topic=t.get("topic", "unknown"),
+                relevance_score=round(t.get("relevance_score", 0), 3),
+            )
+            for t in raw_topics
+            if t.get("relevance_score", 0) >= TOPIC_THRESHOLD
+        ]
+        topics.sort(key=lambda t: t.relevance_score, reverse=True)
+
+        keywords = [str(k) for k in result.get("keywords", [])][:10]
+        summary = str(result.get("summary", ""))
+
+        return page_type, confidence, topics, keywords, summary
+
+    except Exception as exc:
+        logger.warning("gemini classification failed: %s", exc)
+        page_type = sd_page_type[0] if sd_page_type else "other"
+        confidence = sd_page_type[1] if sd_page_type else 0.0
+        return page_type, confidence, [], [], ""
+
+
 async def classify(
     body_text: str, models: dict, metadata: MetadataResponse | None = None,
     executor=None,
@@ -157,23 +218,30 @@ async def classify(
     sd_result = _resolve_page_type_from_structured_data(structured_data)
     classifier_text = _build_classifier_text(body_text, metadata)
 
-    keywords_future = loop.run_in_executor(
-        None, _extract_keywords_hybrid, body_text, metadata, models, structured_data)
-
-    if sd_result:
-        page_type, confidence = sd_result
-        topics_future = loop.run_in_executor(
-            executor, _run_topic_classification, classifier_text, models["classifier"])
-        keywords, topics = await asyncio.gather(keywords_future, topics_future)
-        logger.info("page_type from structured data: %s (%.2f)", page_type, confidence)
+    if CLASSIFIER_BACKEND == "vertex":
+        page_type, confidence, topics, keywords, summary = await _classify_via_gemini(
+            classifier_text, sd_result)
+        if sd_result:
+            logger.info("page_type from structured data: %s (%.2f)", page_type, confidence)
     else:
-        classification_future = loop.run_in_executor(
-            executor, _classify_page_and_topics, classifier_text, models["classifier"])
-        keywords, (page_type, confidence, topics) = await asyncio.gather(
-            keywords_future, classification_future)
+        keywords_future = loop.run_in_executor(
+            None, _extract_keywords_hybrid, body_text, metadata, models, structured_data)
+
+        if sd_result:
+            page_type, confidence = sd_result
+            topics_future = loop.run_in_executor(
+                executor, _run_topic_classification, classifier_text, models["classifier"])
+            keywords, topics = await asyncio.gather(keywords_future, topics_future)
+            logger.info("page_type from structured data: %s (%.2f)", page_type, confidence)
+        else:
+            classification_future = loop.run_in_executor(
+                executor, _classify_page_and_topics, classifier_text, models["classifier"])
+            keywords, (page_type, confidence, topics) = await asyncio.gather(
+                keywords_future, classification_future)
+
+        summary = _build_summary(page_type, topics, structured_data, metadata)
 
     iab_categories = [t.topic for t in topics[:3]]
-    summary = _build_summary(page_type, topics, structured_data, metadata)
 
     logger.info(
         "classification complete | page_type=%s confidence=%.2f topics=%d keywords=%d",

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from curl_cffi.requests import AsyncSession, exceptions
 
-from app.config import FETCH_HEADERS, IMPERSONATE, MAX_REDIRECTS, REQUEST_TIMEOUT
+from app.config import MAX_REDIRECTS
 
 logger = logging.getLogger(__name__)
 
@@ -17,21 +17,13 @@ class CrawlResult:
     error: str | None = None
 
 
-async def fetch(url: str) -> CrawlResult:
+async def fetch(url: str, session: AsyncSession) -> CrawlResult:
     logger.info("starting fetch | url=%s", url)
     start = time.monotonic()
 
     try:
-        async with AsyncSession() as session:
-            logger.info("request sent, awaiting response | url=%s", url)
-            response = await session.get(
-                url,
-                headers=FETCH_HEADERS,
-                impersonate=IMPERSONATE,
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=True,
-                max_redirects=MAX_REDIRECTS,
-            )
+        logger.info("request sent, awaiting response | url=%s", url)
+        response = await session.get(url)
 
         elapsed = round(time.monotonic() - start, 3)
         resolved = str(response.url)

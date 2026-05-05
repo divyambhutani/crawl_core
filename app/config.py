@@ -1,3 +1,12 @@
+import os
+
+# ── Classifier Backend ──
+CLASSIFIER_BACKEND = os.environ.get("CLASSIFIER_BACKEND", "local")
+if CLASSIFIER_BACKEND not in ("local", "vertex"):
+    raise ValueError(f"Invalid CLASSIFIER_BACKEND: {CLASSIFIER_BACKEND!r} (must be 'local' or 'vertex')")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_TIMEOUT = 15
+
 # ── HTTP ──
 REQUEST_TIMEOUT = 15
 MAX_REDIRECTS = 5
