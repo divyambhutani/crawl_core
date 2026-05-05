@@ -9,9 +9,10 @@ from playwright.async_api import async_playwright
 
 from curl_cffi.requests import AsyncSession
 
+from app.fetch import RobotsCache
 from app.config import (
     CLASSIFIER_BACKEND, FETCH_HEADERS, IMPERSONATE, LOG_FORMAT, LOG_LEVEL,
-    MAX_REDIRECTS, REQUEST_TIMEOUT,
+    MAX_REDIRECTS, REQUEST_TIMEOUT, ROBOTS_CACHE_TTL,
 )
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
@@ -74,6 +75,9 @@ async def lifespan(app: FastAPI):
     )
     logger.info("created http_session | time=%.2fs mem=+%.0fMB",
                 time.perf_counter() - t0, _get_rss_mb() - rss0)
+
+    app.state.robots_cache = RobotsCache(ttl=ROBOTS_CACHE_TTL)
+    logger.info("created robots_cache | ttl=%ds", ROBOTS_CACHE_TTL)
 
     t0 = time.perf_counter()
     rss0 = _get_rss_mb()

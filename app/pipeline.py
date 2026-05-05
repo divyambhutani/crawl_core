@@ -22,7 +22,7 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
         # ── Phase 1: Fetch ─────────────────────────────────────────────
         # curl_cffi with browser TLS fingerprint; always attempted first (~200ms)
         t0 = time.perf_counter()
-        result = await fetch(url, app_state.http_session)
+        result = await fetch(url, app_state.http_session, app_state.robots_cache)
         timings["fetch"] = time.perf_counter() - t0
 
         status = "success" if result.error is None else "error"

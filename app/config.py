@@ -25,6 +25,11 @@ FETCH_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+# ── Robots.txt ──
+ROBOTS_USER_AGENT = "CrawlCore/1.0"
+ROBOTS_CACHE_TTL = 3600
+ROBOTS_FETCH_TIMEOUT = 5
+
 # ── Extractor ──
 READING_SPEED_WPM = 200
 

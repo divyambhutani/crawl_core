@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from curl_cffi.requests import AsyncSession, exceptions
 
 from app.config import MAX_REDIRECTS
+from app.fetch.robots import RobotsCache, is_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +18,18 @@ class CrawlResult:
     error: str | None = None
 
 
-async def fetch(url: str, session: AsyncSession) -> CrawlResult:
+async def fetch(url: str, session: AsyncSession, robots_cache: RobotsCache | None = None) -> CrawlResult:
     """Fetch a URL via curl_cffi and return HTML with status metadata."""
     logger.info("starting fetch | url=%s", url)
     start = time.monotonic()
+
+    if robots_cache is not None:
+        if not await is_allowed(url, session, robots_cache):
+            logger.warning("blocked by robots.txt | url=%s", url)
+            return CrawlResult(
+                html="", resolved_url=url, status_code=0,
+                error="robots.txt disallows crawling this URL",
+            )
 
     try:
         logger.info("request sent, awaiting response | url=%s", url)
