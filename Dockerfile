@@ -13,9 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download browser + spaCy model
+# Pre-download browser
 RUN playwright install chromium && playwright install-deps chromium
-RUN python -m spacy download en_core_web_sm
 
 COPY ./app ./app
 
