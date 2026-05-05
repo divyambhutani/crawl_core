@@ -4,11 +4,10 @@ import logging
 import os
 import re
 import threading
+from urllib.parse import urlparse
 
-from app.classify.types import (
-    IAB_TIER1_LABELS, PAGE_LEVEL_TYPES, PAGE_TYPE_LABELS,
-    SCHEMA_TYPE_TO_PAGE_TYPE,
-)
+from app.classify.types import CONTENT_SCHEMA_TYPES, IAB_TIER1_LABELS, PAGE_TYPE_LABELS
+_PAGE_TYPE_LOWER_MAP = {l.lower(): l for l in PAGE_TYPE_LABELS}
 from app.config import (
     BODY_TEXT_LIMIT, CLASSIFIER_BACKEND, GEMINI_MODEL, GEMINI_TIMEOUT,
     TOP_K_KEYWORDS, TOPIC_THRESHOLD,
@@ -37,28 +36,17 @@ def _flatten_structured_data(raw: list) -> list[dict]:
     return result
 
 
-
-def _resolve_page_type_from_structured_data(
-    structured_data: list[dict],
-) -> tuple[str, float] | None:
-    best_page_level: tuple[str, float] | None = None
-    best_embedded: tuple[str, float] | None = None
+def _extract_schema_types(structured_data: list[dict]) -> list[str]:
+    types_seen: list[str] = []
     for item in structured_data:
         raw_type = item.get("@type")
         if not raw_type:
             continue
-        types = raw_type if isinstance(raw_type, list) else [raw_type]
-        for t in types:
-            mapping = SCHEMA_TYPE_TO_PAGE_TYPE.get(t)
-            if not mapping:
-                continue
-            if t in PAGE_LEVEL_TYPES:
-                if best_page_level is None or mapping[1] > best_page_level[1]:
-                    best_page_level = mapping
-            else:
-                if best_embedded is None or mapping[1] > best_embedded[1]:
-                    best_embedded = mapping
-    return best_page_level or best_embedded
+        item_types = raw_type if isinstance(raw_type, list) else [raw_type]
+        for t in item_types:
+            if t not in types_seen:
+                types_seen.append(t)
+    return types_seen
 
 
 def _text_overlap(a: str, b: str) -> float:
@@ -76,31 +64,45 @@ def _text_overlap(a: str, b: str) -> float:
     return len(intersection) / min(len(a_words), len(b_words))
 
 
-def _build_classifier_text(body_text: str, metadata: MetadataResponse | None) -> str:
-    if not metadata:
-        return body_text[:BODY_TEXT_LIMIT]
+def _build_classifier_text(
+    body_text: str, metadata: MetadataResponse | None, url: str,
+    structured_data: list[dict] | None = None,
+) -> str:
+    signals: list[str] = []
 
-    parts: list[str] = []
+    if structured_data:
+        schema_types = _extract_schema_types(structured_data)
+        if schema_types:
+            signals.append(f"schema_types: {', '.join(schema_types)}")
 
-    title = (metadata.title or "").strip()
-    if title:
-        parts.append(title)
+    url_path = urlparse(url).path if url else ""
+    if url_path and url_path != "/":
+        signals.append(f"url_path: {url_path}")
 
-    h1_texts = metadata.headings.get("h1", []) if metadata.headings else []
-    for h1 in h1_texts[:1]:
-        h1 = h1.strip()
-        if h1 and _text_overlap(h1, title) < 0.8:
-            parts.append(h1)
+    if metadata:
+        og_type = (metadata.open_graph.og_type or "") if metadata.open_graph else ""
+        if og_type:
+            signals.append(f"og_type: {og_type}")
 
-    desc = (metadata.description or "").strip()
-    if desc and _text_overlap(desc, title) < 0.8:
-        parts.append(desc)
+        title = (metadata.title or "").strip()
+        if title:
+            signals.append(f"title: {title}")
 
-    prefix = "\n".join(parts)
-    if prefix and body_text:
-        combined = f"{prefix}\n{body_text}"
-    elif prefix:
-        combined = prefix
+        h1_texts = metadata.headings.get("h1", []) if metadata.headings else []
+        for h1 in h1_texts[:1]:
+            h1 = h1.strip()
+            if h1 and _text_overlap(h1, title) < 0.8:
+                signals.append(f"h1: {h1}")
+
+        desc = (metadata.description or "").strip()
+        if desc and _text_overlap(desc, title) < 0.8:
+            signals.append(f"description: {desc}")
+
+    header = "\n".join(signals)
+    if header and body_text:
+        combined = f"{header}\n---\n{body_text}"
+    elif header:
+        combined = header
     else:
         combined = body_text
 
@@ -110,17 +112,13 @@ def _build_classifier_text(body_text: str, metadata: MetadataResponse | None) ->
 # ── Gemini Flash backend ──
 
 _GEMINI_PROMPT_TEMPLATE = """\
-Classify this web page text.
+Classify this web page using ALL the signals provided (schema types, URL path, OG type, metadata, and body text).
 
 PAGE TYPES (pick exactly one):
-product page, blog post, news article, landing page, documentation, forum discussion, other
+{page_types}
 
 TOPIC CATEGORIES (score each 0.0-1.0, only include if >= 0.75):
-Arts & Entertainment, Automotive, Business & Finance, Careers, Education, \
-Family & Parenting, Food & Drink, Health & Fitness, Hobbies & Interests, \
-Home & Garden, Law, Government & Politics, News, Personal Finance, Pets, \
-Real Estate, Religion & Spirituality, Science, Shopping, Society, Sports, \
-Style & Fashion, Technology & Computing, Travel
+{topic_categories}
 
 KEYWORDS: Extract up to 10 keywords/phrases that best describe the page content. Rank by relevance.
 
@@ -129,7 +127,7 @@ SUMMARY: Write one descriptive sentence summarizing what this page is about.
 Return JSON only:
 {{"page_type": "...", "page_type_confidence": 0.95, "topics": [{{"topic": "...", "relevance_score": 0.85}}], "keywords": ["keyword1", "keyword2"], "summary": "One descriptive sentence."}}
 
-TEXT:
+PAGE SIGNALS AND CONTENT:
 {text}"""
 
 _gemini_client = None
@@ -152,13 +150,16 @@ def _get_gemini_client():
 
 async def _classify_via_gemini(
     text: str,
-    sd_page_type: tuple[str, float] | None,
 ) -> tuple[str, float, list[TopicScore], list[str], str]:
     try:
         from google.genai import types
 
         client = _get_gemini_client()
-        prompt = _GEMINI_PROMPT_TEMPLATE.format(text=text)
+        prompt = _GEMINI_PROMPT_TEMPLATE.format(
+            page_types=", ".join(PAGE_TYPE_LABELS),
+            topic_categories=", ".join(IAB_TIER1_LABELS),
+            text=text,
+        )
 
         response = await asyncio.wait_for(
             asyncio.to_thread(
@@ -177,11 +178,9 @@ async def _classify_via_gemini(
             raise ValueError("Gemini returned empty response")
         result = json.loads(response.text)
 
-        if sd_page_type:
-            page_type, confidence = sd_page_type
-        else:
-            page_type = result.get("page_type", "other")
-            confidence = result.get("page_type_confidence", 0.0)
+        raw_page_type = result.get("page_type", "other")
+        page_type = _PAGE_TYPE_LOWER_MAP.get(raw_page_type.lower(), "other")
+        confidence = result.get("page_type_confidence", 0.0)
 
         raw_topics = result.get("topics", [])
         topics = [
@@ -201,44 +200,29 @@ async def _classify_via_gemini(
 
     except Exception as exc:
         logger.warning("gemini classification failed: %s", exc)
-        page_type = sd_page_type[0] if sd_page_type else "other"
-        confidence = sd_page_type[1] if sd_page_type else 0.0
-        return page_type, confidence, [], [], ""
+        return "other", 0.0, [], [], ""
 
 
 async def classify(
     body_text: str, models: dict, metadata: MetadataResponse | None = None,
-    executor=None,
+    url: str = "", executor=None,
 ) -> ClassificationResponse:
     logger.info("starting classification | text_length=%d", len(body_text))
     loop = asyncio.get_running_loop()
 
     structured_data = _flatten_structured_data(metadata.structured_data if metadata else [])
-
-    sd_result = _resolve_page_type_from_structured_data(structured_data)
-    classifier_text = _build_classifier_text(body_text, metadata)
+    classifier_text = _build_classifier_text(body_text, metadata, url, structured_data)
 
     if CLASSIFIER_BACKEND == "vertex":
         page_type, confidence, topics, keywords, summary = await _classify_via_gemini(
-            classifier_text, sd_result)
-        if sd_result:
-            logger.info("page_type from structured data: %s (%.2f)", page_type, confidence)
+            classifier_text)
     else:
         keywords_future = loop.run_in_executor(
             None, _extract_keywords_hybrid, body_text, metadata, models, structured_data)
-
-        if sd_result:
-            page_type, confidence = sd_result
-            topics_future = loop.run_in_executor(
-                executor, _run_topic_classification, classifier_text, models["classifier"])
-            keywords, topics = await asyncio.gather(keywords_future, topics_future)
-            logger.info("page_type from structured data: %s (%.2f)", page_type, confidence)
-        else:
-            classification_future = loop.run_in_executor(
-                executor, _classify_page_and_topics, classifier_text, models["classifier"])
-            keywords, (page_type, confidence, topics) = await asyncio.gather(
-                keywords_future, classification_future)
-
+        classification_future = loop.run_in_executor(
+            executor, _classify_page_and_topics, classifier_text, models["classifier"])
+        keywords, (page_type, confidence, topics) = await asyncio.gather(
+            keywords_future, classification_future)
         summary = _build_summary(page_type, topics, structured_data, metadata)
 
     iab_categories = [t.topic for t in topics[:3]]
@@ -375,7 +359,7 @@ def _add_tier4_yake(
 ) -> None:
     results = kw_extractor.extract_keywords(body_text)
     sorted_results = sorted(results, key=lambda x: x[1])
-    for kw, _score in sorted_results:
+    for kw, _ in sorted_results:
         if len(kw) > 2:
             _add_unique(keywords, kw)
         if len(keywords) >= TOP_K_KEYWORDS:
@@ -431,12 +415,10 @@ def _extract_name_from_structured_data(structured_data: list[dict]) -> str | Non
         if not raw_type:
             continue
         types = raw_type if isinstance(raw_type, list) else [raw_type]
-        for t in types:
-            mapping = SCHEMA_TYPE_TO_PAGE_TYPE.get(t)
-            if mapping is not None:
-                name = item.get("headline") or item.get("name")
-                if name and len(name) > 3:
-                    return name
+        if any(t in CONTENT_SCHEMA_TYPES for t in types):
+            name = item.get("headline") or item.get("name")
+            if name and len(name) > 3:
+                return name
     return None
 
 

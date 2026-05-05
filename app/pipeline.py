@@ -93,6 +93,7 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
                     t0 = time.perf_counter()
                     classification = await classify(
                         content.body_text, models, metadata,
+                        url=result.resolved_url,
                         executor=app_state.model_executor,
                     )
                     timings["classify"] = time.perf_counter() - t0
