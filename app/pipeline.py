@@ -16,8 +16,11 @@ logger = logging.getLogger(__name__)
 async def run_pipeline(url: str, app_state) -> CrawlResponse:
     """Orchestrate fetch → detect → render → parse → extract → classify for a single URL."""
     try:
+        # per-stage latencies accumulated here, logged as a summary line at the end
         timings = {}
 
+        # ── Phase 1: Fetch ─────────────────────────────────────────────
+        # curl_cffi with browser TLS fingerprint; always attempted first (~200ms)
         t0 = time.perf_counter()
         result = await fetch(url, app_state.http_session)
         timings["fetch"] = time.perf_counter() - t0
@@ -33,10 +36,16 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
         classification = None
 
         if result.error is None:
+            # ── Phase 2: Detect ────────────────────────────────────────
+            # checks if curl_cffi got a JS skeleton (empty body, high script ratio,
+            # framework root markers) that needs Playwright browser rendering
             t0 = time.perf_counter()
             analysis = analyze(result.html, result.resolved_url)
             timings["detect"] = time.perf_counter() - t0
-            # both start as curl_cffi HTML; Playwright may override one or both below
+
+            # dual-source routing: parse (metadata) and extract (body text) can use
+            # different HTML sources — curl_cffi's <head> often has better metadata
+            # than Playwright's render, so we only swap the body when possible
             html_for_parse = result.html
             html_for_extract = result.html
 
@@ -55,10 +64,10 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
                         rendered_html = await render_page(browser, result.resolved_url)
                         timings["render"] = time.perf_counter() - t0
                         if analysis.meta_available:
-                            # curl_cffi <head> has good metadata — only replace body
+                            # curl_cffi <head> captured good metadata — only swap body
                             html_for_extract = rendered_html
                         else:
-                            # curl_cffi had no useful metadata either — use Playwright for everything
+                            # curl_cffi had nothing useful — Playwright owns both sources
                             html_for_parse = rendered_html
                             html_for_extract = rendered_html
                     except PlaywrightTimeout:
@@ -76,6 +85,9 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
             else:
                 render_reason = analysis.reason
 
+            # ── Phase 3: Parse + Extract (parallel) ──────────────────
+            # both are CPU-bound (selectolax DOM traversal, trafilatura extraction)
+            # so they run in threads to avoid blocking the async event loop
             loop = asyncio.get_running_loop()
 
             t0 = time.perf_counter()
@@ -87,6 +99,9 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
             )
             timings["parse+extract"] = time.perf_counter() - t0
 
+            # ── Phase 4: Classify ──────────────────────────────────────
+            # requires body text; skipped entirely if extraction produced nothing
+            # (partial results still returned — classification_error explains why)
             if content and content.body_text:
                 try:
                     models = {
@@ -110,10 +125,14 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
             else:
                 classification_error = "classification skipped: no body text extracted"
 
+        # ── Latency summary ────────────────────────────────────────
         parts = [f"{k}={v*1000:.0f}ms" for k, v in timings.items()]
         total = sum(timings.values())
         logger.info("latency | total=%dms %s | url=%s", total * 1000, " ".join(parts), url)
 
+        # ── Build response ─────────────────────────────────────────
+        # each stage can fail independently without blocking others;
+        # errors from render, classification, and fetch are joined into one field
         return CrawlResponse(
             status=status,
             url=url,
@@ -126,7 +145,6 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
             metadata=metadata,
             content=content,
             classification=classification,
-            # merge all partial-failure messages into one field; None if fully clean
             error="; ".join(filter(None, [render_error, classification_error, result.error])) or None,
         )
 
