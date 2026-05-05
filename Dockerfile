@@ -9,19 +9,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxshmfence1 libxrandr2 libxcomposite1 libxdamage1 \
     && rm -rf /var/lib/apt/lists/*
 
-# CPU-only torch first (separate layer, cached)
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-
-# Remaining Python deps
+# Python deps (no torch/transformers — classification via Vertex AI)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download models into image
+# Pre-download browser + spaCy model
 RUN playwright install chromium && playwright install-deps chromium
 RUN python -m spacy download en_core_web_sm
-RUN python -c "from transformers import pipeline; pipeline('zero-shot-classification', model='facebook/bart-large-mnli')"
 
 COPY ./app ./app
 
 EXPOSE 8000
+
+ENV CLASSIFIER_BACKEND=vertex
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
