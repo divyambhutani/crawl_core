@@ -14,7 +14,7 @@ A FastAPI service that takes a single URL, crawls the page, extracts HTML metada
 - **Body Text Extraction:** trafilatura (with BS4 fallback)
 - **Keyword Extraction:** 4-tier hybrid — JSON-LD → spaCy noun chunks → OG tags → YAKE statistical fallback
 - **NLP (keywords):** spaCy `en_core_web_sm` — noun-chunk extraction for Title/H1 keyword seeding
-- **Page Classification:** transformers + `facebook/bart-large-mnli` (zero-shot, NLI-based), with JSON-LD `@type` shortcut
+- **Page Classification:** transformers + `facebook/bart-large-mnli` (zero-shot, NLI-based) — all signals fed to model (schema types, URL path, OG type, metadata, body text)
 
 ### Why These Choices
 
@@ -119,9 +119,9 @@ Extracts clean body text. Signature: `extract(html: str, url: str) -> ContentRes
 
 ### classifier.py
 
-Runs classification + keyword extraction. Signature: `async def classify(body_text: str, models: dict, metadata=None, executor=None) -> ClassificationResponse`. Uses `executor` (ThreadPoolExecutor) to run BART-MNLI inference off the event loop.
+Runs classification + keyword extraction. Signature: `async def classify(body_text: str, models: dict, metadata=None, url="", executor=None) -> ClassificationResponse`. Uses `executor` (ThreadPoolExecutor) to run BART-MNLI inference off the event loop.
 
-**Metadata-aware input:** When `metadata` is provided, BART-MNLI receives composite text: `title\nh1\ndescription\nbody_text`, truncated to `BODY_TEXT_LIMIT` (2800 chars). Duplicate metadata is skipped via overlap detection (`_text_overlap >= 0.8`). YAKE receives raw `body_text` only.
+**Signal-rich input:** Model receives ALL available signals as structured context: schema_types (from JSON-LD @type), url_path, og_type, title, h1, description, then body_text — truncated to `BODY_TEXT_LIMIT` (2800 chars). No static mapping bypasses; model always decides page type from full context. YAKE receives raw `body_text` only.
 
 **1. Keywords (4-tier hybrid extraction):**
 
@@ -145,31 +145,29 @@ Tier 4: YAKE statistical (body text)
   └─ Only triggered when tiers 1-3 yield < TOP_K_KEYWORDS
 ```
 
-**2. Page Type Resolution:**
+**2. Page Type + Topics (always ML inference):**
 
+Model input includes all available signals as structured context:
 ```
-JSON-LD @type → SCHEMA_TYPE_TO_PAGE_TYPE dict
-  ├─ Match found (e.g. "Product" → "product_page", confidence=0.95)
-  │   └─ Skip BART-MNLI entirely for page_type
-  │
-  └─ No match → BART-MNLI zero-shot
-      classifier_text[:BODY_TEXT_LIMIT]
-      candidate_labels = ["product page", "blog post", "news article",
-                          "landing page", "documentation", "forum discussion", "other"]
-      hypothesis_template = "This is a {}."
+schema_types: Product, ItemPage
+url_path: /dp/B009GQ034C/
+og_type: product
+title: ...
+h1: ...
+description: ...
+---
+[body text truncated to BODY_TEXT_LIMIT]
 ```
-
-**3. Topics (always BART-MNLI):**
 
 ```python
-topic_result = classifier(
-    classifier_text[:BODY_TEXT_LIMIT],
-    candidate_labels=IAB_TIER1_LABELS,  # 23 IAB Content Taxonomy Tier 1 categories
-    hypothesis_template="This text is about {}.",
-    multi_label=True
-)
+# Page type: 22 candidate labels, zero-shot NLI
+candidate_labels = PAGE_TYPE_LABELS  # 22 page types
+hypothesis_template = "This is a {}."
+
+# Topics: 32 single-concept labels, multi-label NLI
+candidate_labels = IAB_TIER1_LABELS  # 32 flattened IAB categories
+hypothesis_template = "This text is about {}."
 # Return: all labels with score > TOPIC_THRESHOLD (0.75), sorted by score descending
-# iab_categories field = topic labels from this result
 ```
 
 **4. Summary (structured data aware, no LLM):**
@@ -217,12 +215,12 @@ POST /crawl { url }
   │
   ├─ 4. extractor.extract(final_html)    → body_text + word_count
   │
-  ├─ 5. await classifier.classify(body_text, models, metadata, executor)
+  ├─ 5. await classifier.classify(body_text, models, metadata, url, executor)
   │      ├── 4-tier keywords             → top 10 keywords                        ~5ms
   │      │   (JSON-LD → Title/H1 spaCy → OG → YAKE fallback)
-  │      ├── page_type                   → label + confidence                     ~0-400ms
-  │      │   (JSON-LD @type shortcut OR BART-MNLI zero-shot)
-  │      └── BART-MNLI topics            → IAB ranked list                        ~400ms
+  │      ├── page_type (BART-MNLI)       → label + confidence                     ~400ms
+  │      │   (all signals: schema types, URL path, OG type, title, body)
+  │      └── topics (BART-MNLI)          → 32 single-concept IAB labels           ~400ms
   │
   └─ 6. Assemble CrawlResponse           → return JSON
 ```
@@ -238,7 +236,7 @@ POST /crawl { url }
 - All extraction must handle malformed/missing HTML without crashing.
 - Playwright is a **fallback only** — never the default path. curl_cffi is always attempted first.
 - Playwright page timeout: 30s max. If it times out, return partial results from curl_cffi HTML with a warning in the error field.
-- Composite text (metadata prefix + body_text) sent to BART-MNLI is truncated to `BODY_TEXT_LIMIT` (2800 chars, in `config.py`). BART's tokenizer auto-truncates at 1024 tokens internally; 2800 chars gives the model more context while staying within that window.
+- Classifier input (structured signals header + body_text) sent to BART-MNLI is truncated to `BODY_TEXT_LIMIT` (2800 chars, in `config.py`). BART's tokenizer auto-truncates at 1024 tokens internally; 2800 chars gives the model more context while staying within that window.
 
 ---
 
