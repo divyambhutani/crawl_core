@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 async def run_pipeline(url: str, app_state) -> CrawlResponse:
+    """Orchestrate fetch → detect → render → parse → extract → classify for a single URL."""
     try:
         timings = {}
 
@@ -35,6 +36,7 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
             t0 = time.perf_counter()
             analysis = analyze(result.html, result.resolved_url)
             timings["detect"] = time.perf_counter() - t0
+            # both start as curl_cffi HTML; Playwright may override one or both below
             html_for_parse = result.html
             html_for_extract = result.html
 
@@ -53,8 +55,10 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
                         rendered_html = await render_page(browser, result.resolved_url)
                         timings["render"] = time.perf_counter() - t0
                         if analysis.meta_available:
+                            # curl_cffi <head> has good metadata — only replace body
                             html_for_extract = rendered_html
                         else:
+                            # curl_cffi had no useful metadata either — use Playwright for everything
                             html_for_parse = rendered_html
                             html_for_extract = rendered_html
                     except PlaywrightTimeout:
@@ -122,6 +126,7 @@ async def run_pipeline(url: str, app_state) -> CrawlResponse:
             metadata=metadata,
             content=content,
             classification=classification,
+            # merge all partial-failure messages into one field; None if fully clean
             error="; ".join(filter(None, [render_error, classification_error, result.error])) or None,
         )
 

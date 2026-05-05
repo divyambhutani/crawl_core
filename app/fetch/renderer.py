@@ -12,6 +12,7 @@ BLOCKED_RESOURCES = "**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,mp4,mp3}"
 
 
 async def render_page(browser, url: str) -> str:
+    """Render a JS-heavy page with Playwright and return the final HTML."""
     logger.info("starting js render | url=%s", url)
 
     context = await browser.new_context(

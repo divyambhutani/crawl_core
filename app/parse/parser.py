@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def parse(html: str, url: str) -> MetadataResponse:
+    """Extract all metadata (title, OG, Twitter, JSON-LD, headings) from HTML."""
     logger.info("starting parse | url=%s html_length=%d", url, len(html))
     try:
         return _parse_selectolax(html, url)
@@ -23,6 +24,7 @@ def parse(html: str, url: str) -> MetadataResponse:
 
 
 def _parse_selectolax(html: str, url: str) -> MetadataResponse:
+    """Parse all metadata fields using the selectolax parser."""
     tree = LexborHTMLParser(html)
 
     title = _sl_extract_title(tree, url)
@@ -60,6 +62,7 @@ def _parse_selectolax(html: str, url: str) -> MetadataResponse:
 
 
 def _sl_extract_title(tree: LexborHTMLParser, url: str) -> str | None:
+    """Return text content of <title> tag, or None if missing."""
     tag = tree.css_first("title")
     if tag is None:
         logger.warning("title tag not found | url=%s", url)
@@ -73,6 +76,7 @@ def _sl_extract_title(tree: LexborHTMLParser, url: str) -> str | None:
 
 
 def _sl_extract_description(tree: LexborHTMLParser, url: str) -> str | None:
+    """Return content of meta description tag, or None if missing."""
     tag = tree.css_first('meta[name="description"]')
     if tag is None:
         logger.warning("meta description tag not found | url=%s", url)
@@ -87,6 +91,7 @@ def _sl_extract_description(tree: LexborHTMLParser, url: str) -> str | None:
 
 
 def _sl_extract_canonical(tree: LexborHTMLParser, url: str) -> str | None:
+    """Return href of canonical link tag, or None if missing."""
     tag = tree.css_first('link[rel="canonical"]')
     if tag is None:
         logger.warning("canonical link not found | url=%s", url)
@@ -101,6 +106,7 @@ def _sl_extract_canonical(tree: LexborHTMLParser, url: str) -> str | None:
 
 
 def _sl_extract_language(tree: LexborHTMLParser, url: str) -> str | None:
+    """Return language from html[lang] or meta http-equiv, or None."""
     html_tag = tree.css_first("html")
     if html_tag:
         lang = html_tag.attributes.get("lang")
@@ -123,6 +129,7 @@ def _sl_extract_language(tree: LexborHTMLParser, url: str) -> str | None:
 
 
 def _sl_extract_favicon(tree: LexborHTMLParser, url: str) -> str | None:
+    """Return favicon URL from link tag, falling back to /favicon.ico."""
     for rel in ("icon", "shortcut icon"):
         tag = tree.css_first(f'link[rel="{rel}"]')
         if tag:
@@ -141,6 +148,7 @@ def _sl_extract_favicon(tree: LexborHTMLParser, url: str) -> str | None:
 
 
 def _sl_extract_open_graph(tree: LexborHTMLParser, url: str) -> OpenGraphResponse | None:
+    """Collect og:* meta tags into an OpenGraphResponse."""
     og = {}
     for tag in tree.css("meta[property]"):
         prop = tag.attributes.get("property", "")
@@ -164,6 +172,7 @@ def _sl_extract_open_graph(tree: LexborHTMLParser, url: str) -> OpenGraphRespons
 
 
 def _sl_extract_twitter_card(tree: LexborHTMLParser, url: str) -> TwitterCardResponse | None:
+    """Collect twitter:* meta tags into a TwitterCardResponse."""
     tc = {}
     for tag in tree.css("meta[name]"):
         name = tag.attributes.get("name", "")
@@ -186,6 +195,7 @@ def _sl_extract_twitter_card(tree: LexborHTMLParser, url: str) -> TwitterCardRes
 
 
 def _sl_extract_structured_data(tree: LexborHTMLParser, url: str) -> list[dict]:
+    """Parse all JSON-LD script blocks into a list of dicts."""
     results = []
     scripts = tree.css('script[type="application/ld+json"]')
 
@@ -214,6 +224,7 @@ _SL_SKIP_PATTERNS = {"skip to", "keyboard shortcut", "product summary presents"}
 
 
 def _sl_extract_headings(tree: LexborHTMLParser, url: str) -> dict[str, list[str]]:
+    """Extract h1-h3 text, filtering out nav/footer junk headings."""
     headings: dict[str, list[str]] = {"h1": [], "h2": [], "h3": []}
     for tag in tree.css("h1, h2, h3"):
         text = tag.text(strip=True)
@@ -226,6 +237,7 @@ def _sl_extract_headings(tree: LexborHTMLParser, url: str) -> dict[str, list[str
 
 
 def _sl_is_junk_heading(tag, text: str) -> bool:
+    """Return True if heading is inside nav/footer or matches skip patterns."""
     node = tag.parent
     while node is not None:
         if node.tag in _SL_SKIP_PARENTS:
@@ -239,6 +251,7 @@ def _sl_is_junk_heading(tag, text: str) -> bool:
 
 
 def _parse_bs4(html: str, url: str) -> MetadataResponse:
+    """Parse all metadata fields using BeautifulSoup (fallback path)."""
     soup = BeautifulSoup(html, "lxml")
 
     title = _extract_title(soup, url)
@@ -276,6 +289,7 @@ def _parse_bs4(html: str, url: str) -> MetadataResponse:
 
 
 def _extract_title(soup: BeautifulSoup, url: str) -> str | None:
+    """Return text content of <title> tag, or None if missing (BS4 path)."""
     tag = soup.find("title")
     if tag is None:
         logger.warning("title tag not found | url=%s", url)
@@ -289,6 +303,7 @@ def _extract_title(soup: BeautifulSoup, url: str) -> str | None:
 
 
 def _extract_description(soup: BeautifulSoup, url: str) -> str | None:
+    """Return content of meta description tag, or None if missing (BS4 path)."""
     tag = soup.find("meta", {"name": "description"})
     if tag is None:
         logger.warning("meta description tag not found | url=%s", url)
@@ -303,6 +318,7 @@ def _extract_description(soup: BeautifulSoup, url: str) -> str | None:
 
 
 def _extract_canonical(soup: BeautifulSoup, url: str) -> str | None:
+    """Return href of canonical link tag, or None if missing (BS4 path)."""
     tag = soup.find("link", {"rel": "canonical"})
     if tag is None:
         logger.warning("canonical link not found | url=%s", url)
@@ -317,6 +333,7 @@ def _extract_canonical(soup: BeautifulSoup, url: str) -> str | None:
 
 
 def _extract_language(soup: BeautifulSoup, url: str) -> str | None:
+    """Return language from html[lang] or meta http-equiv, or None (BS4 path)."""
     html_tag = soup.find("html")
     if html_tag:
         lang = html_tag.get("lang")
@@ -339,6 +356,7 @@ def _extract_language(soup: BeautifulSoup, url: str) -> str | None:
 
 
 def _extract_favicon(soup: BeautifulSoup, url: str) -> str | None:
+    """Return favicon URL from link tag, falling back to /favicon.ico (BS4 path)."""
     for rel in ("icon", "shortcut icon"):
         tag = soup.find("link", {"rel": rel})
         if tag:
@@ -357,6 +375,7 @@ def _extract_favicon(soup: BeautifulSoup, url: str) -> str | None:
 
 
 def _extract_open_graph(soup: BeautifulSoup, url: str) -> OpenGraphResponse | None:
+    """Collect og:* meta tags into an OpenGraphResponse (BS4 path)."""
     og = {}
     for tag in soup.find_all("meta", attrs={"property": True}):
         prop = tag.get("property", "")
@@ -380,6 +399,7 @@ def _extract_open_graph(soup: BeautifulSoup, url: str) -> OpenGraphResponse | No
 
 
 def _extract_twitter_card(soup: BeautifulSoup, url: str) -> TwitterCardResponse | None:
+    """Collect twitter:* meta tags into a TwitterCardResponse (BS4 path)."""
     tc = {}
     for tag in soup.find_all("meta", attrs={"name": True}):
         name = tag.get("name", "")
@@ -402,6 +422,7 @@ def _extract_twitter_card(soup: BeautifulSoup, url: str) -> TwitterCardResponse 
 
 
 def _extract_structured_data(soup: BeautifulSoup, url: str) -> list[dict]:
+    """Parse all JSON-LD script blocks into a list of dicts (BS4 path)."""
     results = []
     scripts = soup.find_all("script", {"type": "application/ld+json"})
 
@@ -430,6 +451,7 @@ _SKIP_PATTERNS = {"skip to", "keyboard shortcut", "product summary presents"}
 
 
 def _extract_headings(soup: BeautifulSoup, url: str) -> dict[str, list[str]]:
+    """Extract h1-h3 text, filtering out nav/footer junk headings (BS4 path)."""
     headings: dict[str, list[str]] = {"h1": [], "h2": [], "h3": []}
     for tag in soup.find_all(["h1", "h2", "h3"]):
         text = tag.get_text(strip=True)
@@ -442,6 +464,7 @@ def _extract_headings(soup: BeautifulSoup, url: str) -> dict[str, list[str]]:
 
 
 def _is_junk_heading(tag, text: str) -> bool:
+    """Return True if heading is inside nav/footer or matches skip patterns (BS4 path)."""
     for parent in tag.parents:
         if parent.name in _SKIP_PARENTS:
             return True

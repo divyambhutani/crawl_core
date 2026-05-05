@@ -9,6 +9,7 @@ API_TOKEN = os.environ.get("API_TOKEN")
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
+        """Reject requests missing a valid Bearer token (skips /health)."""
         if request.url.path == "/health":
             return await call_next(request)
         if not API_TOKEN:

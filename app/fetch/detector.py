@@ -36,6 +36,7 @@ class FetchAnalysis:
 
 
 def analyze(html: str, url: str) -> FetchAnalysis:
+    """Determine whether a page needs JS rendering based on content signals."""
     logger.info("starting analysis | url=%s html_length=%d", url, len(html))
 
     if len(html) < 50:
@@ -53,6 +54,7 @@ def analyze(html: str, url: str) -> FetchAnalysis:
 
 
 def _analyze_selectolax(html: str, url: str) -> FetchAnalysis:
+    """Run JS-detection analysis using the selectolax parser."""
     tree = LexborHTMLParser(html)
 
     body_length = _sl_get_body_text_length(tree)
@@ -71,16 +73,19 @@ def _analyze_selectolax(html: str, url: str) -> FetchAnalysis:
 
 
 def _sl_get_body_text_length(tree: LexborHTMLParser) -> int:
+    """Return stripped text length of <body> via selectolax."""
     if tree.body is None:
         return 0
     return len(tree.body.text(strip=True))
 
 
 def _sl_count_content_elements(tree: LexborHTMLParser) -> int:
+    """Count p, h1-h3, article, and section elements via selectolax."""
     return len(tree.css(CONTENT_TAGS_CSS))
 
 
 def _sl_calc_script_ratio(scripts: list, html_length: int) -> float:
+    """Return ratio of inline script bytes to total HTML length."""
     if not html_length:
         return 0.0
     script_size = sum(len(s.text() or "") for s in scripts)
@@ -88,6 +93,7 @@ def _sl_calc_script_ratio(scripts: list, html_length: int) -> float:
 
 
 def _sl_has_skeleton_markers(tree: LexborHTMLParser) -> tuple[bool, str]:
+    """Check for empty SPA root divs, loading text, or noscript warnings."""
     for div in tree.css("div[id]"):
         div_id = div.attributes.get("id")
         if div_id in SKELETON_IDS:
@@ -109,6 +115,7 @@ def _sl_has_skeleton_markers(tree: LexborHTMLParser) -> tuple[bool, str]:
 
 
 def _sl_check_meta_available(tree: LexborHTMLParser) -> bool:
+    """Return True if <head> has a useful title and description."""
     title_tag = tree.css_first("title")
     if not title_tag or len(title_tag.text(strip=True)) <= 10:
         return False
@@ -124,6 +131,7 @@ def _sl_check_meta_available(tree: LexborHTMLParser) -> bool:
 
 
 def _analyze_bs4(html: str, url: str) -> FetchAnalysis:
+    """Run JS-detection analysis using BeautifulSoup (fallback path)."""
     soup = BeautifulSoup(html, "lxml")
 
     body_length = _get_body_text_length(soup)
@@ -142,16 +150,19 @@ def _analyze_bs4(html: str, url: str) -> FetchAnalysis:
 
 
 def _get_body_text_length(soup: BeautifulSoup) -> int:
+    """Return stripped text length of <body> via BS4."""
     if soup.body is None:
         return 0
     return len(soup.body.get_text(strip=True))
 
 
 def _count_content_elements(soup: BeautifulSoup) -> int:
+    """Count p, h1-h3, article, and section elements via BS4."""
     return len(soup.find_all(list(CONTENT_TAGS)))
 
 
 def _calc_script_ratio(scripts: list, html_length: int) -> float:
+    """Return ratio of inline script bytes to total HTML length (BS4 path)."""
     if not html_length:
         return 0.0
     script_size = sum(len(s.string or "") for s in scripts)
@@ -159,6 +170,7 @@ def _calc_script_ratio(scripts: list, html_length: int) -> float:
 
 
 def _has_skeleton_markers(soup: BeautifulSoup) -> tuple[bool, str]:
+    """Check for empty SPA root divs, loading text, or noscript warnings (BS4 path)."""
     for div in soup.find_all("div", id=True):
         div_id = div.get("id")
         if div_id in SKELETON_IDS:
@@ -181,6 +193,7 @@ def _has_skeleton_markers(soup: BeautifulSoup) -> tuple[bool, str]:
 
 
 def _check_meta_available(soup: BeautifulSoup) -> bool:
+    """Return True if <head> has a useful title and description (BS4 path)."""
     title_tag = soup.find("title")
     if not title_tag or len(title_tag.get_text(strip=True)) <= 10:
         return False
@@ -196,6 +209,7 @@ def _check_meta_available(soup: BeautifulSoup) -> bool:
 
 
 def _has_framework_fingerprints(html: str) -> list[str]:
+    """Detect React, Angular, or Vue signatures in raw HTML."""
     found = []
     for framework, markers in FRAMEWORK_SIGNATURES.items():
         if any(marker in html for marker in markers):
@@ -215,10 +229,13 @@ def _build_result(
     url: str,
     parser_name: str,
 ) -> FetchAnalysis:
+    """Combine all detection signals into a final needs-JS-render decision."""
     body_sufficient = body_length >= MIN_BODY_LENGTH and content_count >= MIN_CONTENT_ELEMENTS
     body_sparse = body_length < MIN_BODY_LENGTH
     script_heavy = script_ratio > MAX_SCRIPT_RATIO or script_tag_count >= MIN_SCRIPT_TAG_COUNT
 
+    # priority: sufficient content → no JS | skeleton → JS | script-heavy → JS
+    #           nav-only shell → JS | sparse but static → no JS
     if body_sufficient:
         needs_js = False
         reason = f"body has {body_length} chars and {content_count} content elements"

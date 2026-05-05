@@ -18,6 +18,7 @@ class CrawlResult:
 
 
 async def fetch(url: str, session: AsyncSession) -> CrawlResult:
+    """Fetch a URL via curl_cffi and return HTML with status metadata."""
     logger.info("starting fetch | url=%s", url)
     start = time.monotonic()
 

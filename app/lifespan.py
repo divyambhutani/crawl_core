@@ -19,15 +19,18 @@ logger = logging.getLogger(__name__)
 
 
 def _get_rss_mb() -> float:
+    """Return current process RSS in megabytes."""
     return psutil.Process().memory_info().rss / (1024 * 1024)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Load models, browser, and HTTP session on startup; tear down on shutdown."""
     startup_start = time.perf_counter()
     startup_rss = _get_rss_mb()
     logger.info("=== startup begin ===")
 
+    # local backend needs BART-MNLI + spaCy + YAKE; vertex backend skips all three
     if CLASSIFIER_BACKEND == "local":
         from transformers import pipeline as hf_pipeline
         t0 = time.perf_counter()

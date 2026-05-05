@@ -7,7 +7,6 @@ import threading
 from urllib.parse import urlparse
 
 from app.classify.types import CONTENT_SCHEMA_TYPES, IAB_TIER1_LABELS, PAGE_TYPE_LABELS
-_PAGE_TYPE_LOWER_MAP = {l.lower(): l for l in PAGE_TYPE_LABELS}
 from app.config import (
     BODY_TEXT_LIMIT, CLASSIFIER_BACKEND, GEMINI_MODEL, GEMINI_TIMEOUT,
     TOP_K_KEYWORDS, TOPIC_THRESHOLD,
@@ -16,11 +15,19 @@ from app.schemas import ClassificationResponse, MetadataResponse, TopicScore
 
 logger = logging.getLogger(__name__)
 
+_PAGE_TYPE_LOWER_MAP = {l.lower(): l for l in PAGE_TYPE_LABELS}
+
 _TITLE_SUFFIX_RE = re.compile(r"\s*[|–—\-]\s*[^|–—\-]{3,30}$")
 _TITLE_SPLIT_RE = re.compile(r"\s*[|–—]\s*")
 
 
+def _normalize_types(raw_type) -> list[str]:
+    """Ensure @type is always a list (handles single-string case)."""
+    return raw_type if isinstance(raw_type, list) else [raw_type]
+
+
 def _flatten_structured_data(raw: list) -> list[dict]:
+    """Flatten nested JSON-LD @graph arrays into a single list of typed items."""
     result: list[dict] = []
     for item in raw:
         if isinstance(item, dict):
@@ -37,25 +44,28 @@ def _flatten_structured_data(raw: list) -> list[dict]:
 
 
 def _extract_schema_types(structured_data: list[dict]) -> list[str]:
+    """Collect unique @type values from all structured data items."""
     types_seen: list[str] = []
     for item in structured_data:
         raw_type = item.get("@type")
         if not raw_type:
             continue
-        item_types = raw_type if isinstance(raw_type, list) else [raw_type]
-        for t in item_types:
+        for t in _normalize_types(raw_type):
             if t not in types_seen:
                 types_seen.append(t)
     return types_seen
 
 
 def _text_overlap(a: str, b: str) -> float:
+    """Return 0.0-1.0 similarity score between two strings."""
     if not a or not b:
         return 0.0
     a_lower, b_lower = a.lower(), b.lower()
+    # fast path: if shorter string is a near-complete substring, treat as identical
     shorter, longer = (a_lower, b_lower) if len(a_lower) <= len(b_lower) else (b_lower, a_lower)
     if shorter in longer and len(shorter) / len(longer) >= 0.7:
         return 1.0
+    # fallback: word-level Jaccard against the smaller set
     a_words = set(a_lower.split())
     b_words = set(b_lower.split())
     if not a_words or not b_words:
@@ -68,6 +78,7 @@ def _build_classifier_text(
     body_text: str, metadata: MetadataResponse | None, url: str,
     structured_data: list[dict] | None = None,
 ) -> str:
+    """Combine all page signals (schema types, URL, OG, title, body) into model input."""
     signals: list[str] = []
 
     if structured_data:
@@ -88,9 +99,10 @@ def _build_classifier_text(
         if title:
             signals.append(f"title: {title}")
 
+        # skip h1/desc if they mostly repeat the title — avoids wasting model tokens
         h1_texts = metadata.headings.get("h1", []) if metadata.headings else []
-        for h1 in h1_texts[:1]:
-            h1 = h1.strip()
+        if h1_texts:
+            h1 = h1_texts[0].strip()
             if h1 and _text_overlap(h1, title) < 0.8:
                 signals.append(f"h1: {h1}")
 
@@ -98,6 +110,7 @@ def _build_classifier_text(
         if desc and _text_overlap(desc, title) < 0.8:
             signals.append(f"description: {desc}")
 
+    # structured signals above the separator, body text below
     header = "\n".join(signals)
     if header and body_text:
         combined = f"{header}\n---\n{body_text}"
@@ -109,9 +122,7 @@ def _build_classifier_text(
     return combined[:BODY_TEXT_LIMIT]
 
 
-# ── Gemini Flash backend ──
-
-_GEMINI_PROMPT_TEMPLATE = """\
+_GEMINI_PROMPT_PREFIX = """\
 Classify this web page using ALL the signals provided (schema types, URL path, OG type, metadata, and body text).
 
 PAGE TYPES (pick exactly one):
@@ -128,18 +139,26 @@ Return JSON only:
 {{"page_type": "...", "page_type_confidence": 0.95, "topics": [{{"topic": "...", "relevance_score": 0.85}}], "keywords": ["keyword1", "keyword2"], "summary": "One descriptive sentence."}}
 
 PAGE SIGNALS AND CONTENT:
-{text}"""
+""".format(
+    page_types=", ".join(PAGE_TYPE_LABELS),
+    topic_categories=", ".join(IAB_TIER1_LABELS),
+)
 
 _gemini_client = None
 _gemini_lock = threading.Lock()
+_gemini_types = None
 
 
 def _get_gemini_client():
-    global _gemini_client
+    """Return the Vertex AI Gemini client, creating it on first call (thread-safe)."""
+    global _gemini_client, _gemini_types
     if _gemini_client is None:
         with _gemini_lock:
             if _gemini_client is None:
                 from google import genai
+                from google.genai import types
+                # types must be set before client — other threads read types without the lock
+                _gemini_types = types
                 _gemini_client = genai.Client(
                     vertexai=True,
                     project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
@@ -151,22 +170,17 @@ def _get_gemini_client():
 async def _classify_via_gemini(
     text: str,
 ) -> tuple[str, float, list[TopicScore], list[str], str]:
+    """Send text to Gemini Flash and parse page_type, topics, keywords, summary."""
     try:
-        from google.genai import types
-
         client = _get_gemini_client()
-        prompt = _GEMINI_PROMPT_TEMPLATE.format(
-            page_types=", ".join(PAGE_TYPE_LABELS),
-            topic_categories=", ".join(IAB_TIER1_LABELS),
-            text=text,
-        )
+        prompt = _GEMINI_PROMPT_PREFIX + text
 
         response = await asyncio.wait_for(
             asyncio.to_thread(
                 client.models.generate_content,
                 model=GEMINI_MODEL,
                 contents=prompt,
-                config=types.GenerateContentConfig(
+                config=_gemini_types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.0,
                 ),
@@ -178,6 +192,7 @@ async def _classify_via_gemini(
             raise ValueError("Gemini returned empty response")
         result = json.loads(response.text)
 
+        # normalize Gemini's free-text page_type to a known label, default "other"
         raw_page_type = result.get("page_type", "other")
         page_type = _PAGE_TYPE_LOWER_MAP.get(raw_page_type.lower(), "other")
         confidence = result.get("page_type_confidence", 0.0)
@@ -207,6 +222,7 @@ async def classify(
     body_text: str, models: dict, metadata: MetadataResponse | None = None,
     url: str = "", executor=None,
 ) -> ClassificationResponse:
+    """Run full classification pipeline: page type, topics, keywords, and summary."""
     logger.info("starting classification | text_length=%d", len(body_text))
     loop = asyncio.get_running_loop()
 
@@ -244,13 +260,13 @@ async def classify(
 
 def _extract_keywords_hybrid(
     body_text: str, metadata: MetadataResponse | None, models: dict,
-    structured_data: list[dict] | None = None,
+    structured_data: list[dict],
 ) -> list[str]:
+    """Extract keywords using 4-tier cascade: JSON-LD → title/H1 → OG → YAKE."""
     keywords: list[str] = []
 
     if metadata:
-        sd = structured_data if structured_data is not None else _flatten_structured_data(metadata.structured_data)
-        _add_tier1_jsonld(keywords, sd)
+        _add_tier1_jsonld(keywords, structured_data)
         _add_tier2_title_h1(keywords, metadata, models.get("nlp"))
         _add_tier3_og(keywords, metadata)
 
@@ -261,12 +277,12 @@ def _extract_keywords_hybrid(
 
 
 def _add_tier1_jsonld(keywords: list[str], structured_data: list[dict]) -> None:
+    """Extract keywords from JSON-LD product names, brands, article headlines."""
     for item in structured_data:
         schema_type = item.get("@type")
         if not schema_type:
             continue
-        types = schema_type if isinstance(schema_type, list) else [schema_type]
-        type_set = set(types)
+        type_set = set(_normalize_types(schema_type))
 
         if type_set & {"Product", "IndividualProduct", "ProductGroup"}:
             name = item.get("name", "")
@@ -303,6 +319,7 @@ def _add_tier1_jsonld(keywords: list[str], structured_data: list[dict]) -> None:
 def _add_tier2_title_h1(
     keywords: list[str], metadata: MetadataResponse, nlp,
 ) -> None:
+    """Extract noun-chunk keywords from page title and H1 headings."""
     texts: list[str] = []
 
     title = metadata.title or ""
@@ -332,6 +349,7 @@ def _add_tier2_title_h1(
 
 
 def _add_tier3_og(keywords: list[str], metadata: MetadataResponse) -> None:
+    """Add keywords from Open Graph title and description if not redundant."""
     title = (metadata.title or "").lower()
     og = metadata.open_graph
     if not og:
@@ -357,6 +375,7 @@ def _add_tier3_og(keywords: list[str], metadata: MetadataResponse) -> None:
 def _add_tier4_yake(
     keywords: list[str], body_text: str, kw_extractor,
 ) -> None:
+    """Fill remaining keyword slots using YAKE statistical extraction on body text."""
     results = kw_extractor.extract_keywords(body_text)
     sorted_results = sorted(results, key=lambda x: x[1])
     for kw, _ in sorted_results:
@@ -367,11 +386,13 @@ def _add_tier4_yake(
 
 
 def _add_unique(keywords: list[str], candidate: str) -> None:
+    """Append candidate if not a duplicate or substring of an existing keyword."""
     if len(keywords) >= TOP_K_KEYWORDS:
         return
     candidate_lower = candidate.lower().strip()
     if len(candidate_lower) < 3:
         return
+    # reject exact match, substring overlap, or high word-overlap with any existing keyword
     for existing in keywords:
         existing_lower = existing.lower()
         if candidate_lower == existing_lower:
@@ -384,6 +405,7 @@ def _add_unique(keywords: list[str], candidate: str) -> None:
 
 
 def _run_topic_classification(text: str, classifier) -> list[TopicScore]:
+    """Run multi-label zero-shot NLI against 32 IAB topic categories."""
     result = classifier(
         text,
         candidate_labels=IAB_TIER1_LABELS,
@@ -400,6 +422,7 @@ def _run_topic_classification(text: str, classifier) -> list[TopicScore]:
 def _classify_page_and_topics(
     text: str, classifier,
 ) -> tuple[str, float, list[TopicScore]]:
+    """Run zero-shot page type classification then topic classification."""
     page_result = classifier(
         text,
         candidate_labels=PAGE_TYPE_LABELS,
@@ -410,12 +433,12 @@ def _classify_page_and_topics(
 
 
 def _extract_name_from_structured_data(structured_data: list[dict]) -> str | None:
+    """Return headline or name from the first content-type schema item, or None."""
     for item in structured_data:
         raw_type = item.get("@type")
         if not raw_type:
             continue
-        types = raw_type if isinstance(raw_type, list) else [raw_type]
-        if any(t in CONTENT_SCHEMA_TYPES for t in types):
+        if any(t in CONTENT_SCHEMA_TYPES for t in _normalize_types(raw_type)):
             name = item.get("headline") or item.get("name")
             if name and len(name) > 3:
                 return name
@@ -423,7 +446,9 @@ def _extract_name_from_structured_data(structured_data: list[dict]) -> str | Non
 
 
 def _clean_title(title: str) -> str:
+    """Strip site-name suffixes and truncate long titles to ~80 chars."""
     cleaned = _TITLE_SUFFIX_RE.sub("", title).strip()
+    # break at comma or word boundary to avoid mid-word truncation
     if len(cleaned) > 80:
         trunc = cleaned[:80]
         last_comma = trunc.rfind(",")
@@ -442,8 +467,10 @@ def _build_summary(
     structured_data: list[dict],
     metadata: MetadataResponse | None,
 ) -> str:
+    """Build a one-line summary from structured data name or cleaned title."""
     topic_part = ", ".join(t.topic for t in topics[:3]) or "general content"
 
+    # prefer structured data name > cleaned HTML title > generic fallback
     sd_name = _extract_name_from_structured_data(structured_data)
     if sd_name:
         return f"{sd_name} — a {page_type} about {topic_part}."

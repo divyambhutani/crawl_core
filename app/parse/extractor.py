@@ -20,6 +20,7 @@ STRIP_TAGS = {"script", "style", "nav", "footer", "header", "aside"}
 
 
 def extract(html: str, url: str) -> ContentResponse:
+    """Extract clean body text from HTML with word count and reading time."""
     logger.info("starting extraction | url=%s html_length=%d", url, len(html))
 
     pruned = _prune_html(html, url)
@@ -51,9 +52,11 @@ def extract(html: str, url: str) -> ContentResponse:
 
 
 def _prune_html(html: str, url: str) -> str:
+    """Narrow HTML to main content area and strip nav/footer/site-specific noise."""
     try:
         soup = BeautifulSoup(html, "lxml")
 
+        # narrow to <main>/<article> if it has real content — reduces noise for trafilatura
         main = soup.find("main") or soup.find(attrs={"role": "main"}) or soup.find("article")
         if main and len(main.get_text(strip=True)) > 200:
             head = soup.find("head")
@@ -74,6 +77,7 @@ def _prune_html(html: str, url: str) -> str:
             for el in soup.select(selector):
                 el.decompose()
 
+        # site-specific pruning (e.g., Amazon review sections)
         hostname = urlparse(url).hostname or ""
         for domain_pattern, selectors in SITE_PRUNE_SELECTORS.items():
             if domain_pattern in hostname:
@@ -89,6 +93,7 @@ def _prune_html(html: str, url: str) -> str:
 
 
 def _extract_trafilatura(html: str, url: str) -> str:
+    """Run trafilatura content extraction with precision mode."""
     try:
         text = trafilatura.extract(
             html,
@@ -108,6 +113,7 @@ def _extract_trafilatura(html: str, url: str) -> str:
 
 
 def _extract_bs4_fallback(html: str, url: str) -> str:
+    """Strip non-content tags and return body text as plain string (BS4 fallback)."""
     try:
         soup = BeautifulSoup(html, "lxml")
         for tag in soup.find_all(STRIP_TAGS):
