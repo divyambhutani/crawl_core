@@ -21,4 +21,5 @@ COPY ./app ./app
 EXPOSE 8000
 
 ENV CLASSIFIER_BACKEND=vertex
+ENV TZ=America/New_York
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

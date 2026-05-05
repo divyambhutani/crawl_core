@@ -1,4 +1,6 @@
+import locale as _locale
 import os
+from pathlib import Path
 
 # ── Classifier Backend ──
 CLASSIFIER_BACKEND = os.environ.get("CLASSIFIER_BACKEND", "local")
@@ -72,6 +74,27 @@ JS_EXTRA_WAIT = 2000
 VIEWPORT_WIDTH = 1280
 VIEWPORT_HEIGHT = 720
 JS_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+
+def _detect_timezone() -> str:
+    tz = os.environ.get("TZ")
+    if tz:
+        return tz
+    try:
+        return Path("/etc/timezone").read_text().strip()
+    except (FileNotFoundError, PermissionError):
+        return "America/New_York"
+
+
+def _detect_locale() -> str:
+    lang, _ = _locale.getlocale()
+    if lang and lang not in ("C", "POSIX"):
+        return lang.replace("_", "-")
+    return "en-US"
+
+
+JS_LOCALE = _detect_locale()
+JS_TIMEZONE_ID = _detect_timezone()
 
 # ── Logging ──
 LOG_LEVEL = "INFO"
