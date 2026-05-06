@@ -5,13 +5,15 @@ from pathlib import Path
 # ── Classifier Backend ──
 CLASSIFIER_BACKEND = os.environ.get("CLASSIFIER_BACKEND", "local")
 if CLASSIFIER_BACKEND not in ("local", "vertex"):
-    raise ValueError(f"Invalid CLASSIFIER_BACKEND: {CLASSIFIER_BACKEND!r} (must be 'local' or 'vertex')")
+    raise ValueError(
+        f"Invalid CLASSIFIER_BACKEND: {CLASSIFIER_BACKEND!r} (must be 'local' or 'vertex')")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_TIMEOUT = 15
 
 # ── HTTP ──
 REQUEST_TIMEOUT = 15
 MAX_REDIRECTS = 5
+MAX_RESPONSE_SIZE = 10 * 1024 * 1024
 IMPERSONATE = "chrome120"
 FETCH_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",

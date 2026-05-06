@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from curl_cffi.requests import AsyncSession, exceptions
 
-from app.config import MAX_REDIRECTS
+from app.config import MAX_REDIRECTS, MAX_RESPONSE_SIZE
 from app.fetch.robots import RobotsCache, is_allowed
 
 logger = logging.getLogger(__name__)
@@ -16,6 +16,33 @@ class CrawlResult:
     resolved_url: str
     status_code: int
     error: str | None = None
+
+
+def _check_response_size(url: str, response) -> CrawlResult | None:
+    """Return a CrawlResult error if response exceeds MAX_RESPONSE_SIZE, else None."""
+    resolved = str(response.url)
+
+    header_size = response.headers.get("Content-Length")
+    if header_size:
+        try:
+            declared = int(header_size)
+        except (ValueError, TypeError):
+            declared = 0
+        if declared > MAX_RESPONSE_SIZE:
+            logger.warning("response too large (header) | url=%s size=%s", url, header_size)
+            return CrawlResult(
+                html="", resolved_url=resolved, status_code=response.status_code,
+                error=f"Resource at {url} too large: {declared} bytes (limit: {MAX_RESPONSE_SIZE})",
+            )
+
+    if len(response.content) > MAX_RESPONSE_SIZE:
+        logger.warning("response too large (body) | url=%s size=%d", url, len(response.content))
+        return CrawlResult(
+            html="", resolved_url=resolved, status_code=response.status_code,
+            error=f"Resource at {url} too large: {len(response.content)} bytes (limit: {MAX_RESPONSE_SIZE})",
+        )
+
+    return None
 
 
 async def fetch(url: str, session: AsyncSession, robots_cache: RobotsCache | None = None) -> CrawlResult:
@@ -34,6 +61,10 @@ async def fetch(url: str, session: AsyncSession, robots_cache: RobotsCache | Non
     try:
         logger.info("request sent, awaiting response | url=%s", url)
         response = await session.get(url)
+
+        size_error = _check_response_size(url, response)
+        if size_error:
+            return size_error
 
         elapsed = round(time.monotonic() - start, 3)
         resolved = str(response.url)
