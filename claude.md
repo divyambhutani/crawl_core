@@ -37,20 +37,24 @@ crawl_core/
 │   ├── main.py              # FastAPI app, routes (~30 lines)
 │   ├── lifespan.py          # startup/shutdown, model loading
 │   ├── pipeline.py          # crawl orchestration, latency tracking
-│   ├── config.py            # all constants and thresholds (no .env, pure Python)
+│   ├── auth.py              # TokenAuthMiddleware for Cloud Run deployment
+│   ├── config.py            # all constants, thresholds, dynamic locale/timezone detection
 │   ├── schemas.py           # Pydantic request/response models
 │   ├── fetch/
-│   │   ├── __init__.py      # re-exports: fetch, analyze, render_page
+│   │   ├── __init__.py      # re-exports: fetch, analyze, render_page, RobotsCache
 │   │   ├── fetcher.py       # fetch URL via curl_cffi (primary)
 │   │   ├── detector.py      # analyze HTML to detect JS-heavy skeleton pages
-│   │   └── renderer.py      # Playwright fallback for JS-heavy pages
+│   │   ├── renderer.py      # Playwright fallback for JS-heavy pages
+│   │   ├── constants.py     # shared constants for detector + renderer
+│   │   └── robots.py        # robots.txt compliance with in-memory TTL cache
 │   ├── parse/
 │   │   ├── __init__.py      # re-exports: parse, extract
 │   │   ├── parser.py        # extract metadata from HTML (selectolax + BS4 fallback)
 │   │   └── extractor.py     # extract clean body text (trafilatura)
 │   └── classify/
 │       ├── __init__.py      # re-exports: classify
-│       └── classifier.py    # page type + topic classification
+│       ├── classifier.py    # page type + topic classification
+│       └── types.py         # PAGE_TYPE_LABELS, IAB_TIER1_LABELS, CONTENT_SCHEMA_TYPES
 ├── requirements.txt
 ├── Dockerfile
 ├── .env.example
@@ -77,9 +81,21 @@ Error handling: unhandled exceptions return HTTP 200 with `{"status": "error", "
 
 Primary HTTP fetch via `curl_cffi.requests.AsyncSession`. Always attempted first (~200ms).
 
-- Signature: `async fetch(url: str) -> CrawlResult`
+- Signature: `async fetch(url: str, session: AsyncSession, robots_cache: RobotsCache | None = None) -> CrawlResult`
 - Config: timeout 15s, `impersonate="chrome120"`, `max_redirects=5`, `FETCH_HEADERS` (Chrome 120 security headers from `config.py`)
+- Pre-fetch: checks robots.txt compliance (returns error if disallowed)
+- Post-fetch: enforces `MAX_RESPONSE_SIZE` (10MB) — two-layer guard via Content-Length header then actual body size
 - Tracks `resolved_url` after redirects. Returns structured error for 4xx/5xx.
+
+### robots.py
+
+robots.txt compliance layer. Checks if crawling is allowed before fetching.
+
+- Uses Python stdlib `urllib.robotparser.RobotFileParser`
+- In-memory per-domain cache with TTL (`ROBOTS_CACHE_TTL` = 3600s)
+- User-agent: `ROBOTS_USER_AGENT` ("CrawlCore/1.0")
+- Fetches robots.txt via the shared `AsyncSession` (reuses TLS fingerprint)
+- On fetch failure (timeout, 5xx): defaults to allowing crawl
 
 ### detector.py
 
@@ -99,6 +115,7 @@ Decision: sufficient body content → `needs_js_render=False`. Empty body + high
 Playwright fallback. Only called when `needs_js_render=True`. Signature: `async render_page(browser, url: str) -> str`.
 
 - Browser launched once at startup (`app.state.browser`). Each request creates isolated context with stealth.
+- Stealth config uses dynamically detected `JS_LOCALE` and `JS_TIMEZONE_ID` (from `config.py`).
 - Blocks images/fonts/media. Waits for `networkidle` + `JS_EXTRA_WAIT` (2s). Timeout: `JS_RENDER_TIMEOUT` (30s).
 - If `meta_available=True`: only Playwright body merged with curl_cffi `<head>` metadata.
 
@@ -196,7 +213,10 @@ Output: f"{page_type}: {name}, about {top_3_topics}"
 ```
 POST /crawl { url }
   │
-  ├─ 1. fetcher.fetch(url)               → CrawlResult (HTML + resolved_url)     ~200ms
+  ├─ 1. fetcher.fetch(url, session, robots_cache)
+  │      ├── robots.txt check            → reject if disallowed                   ~50ms (cached)
+  │      ├── HTTP GET                    → CrawlResult (HTML + resolved_url)      ~200ms
+  │      └── response size guard         → reject if > 10MB
   │
   ├─ 2. detector.analyze(html, url)      → FetchAnalysis
   │      │
@@ -237,6 +257,7 @@ POST /crawl { url }
 - Playwright is a **fallback only** — never the default path. curl_cffi is always attempted first.
 - Playwright page timeout: 30s max. If it times out, return partial results from curl_cffi HTML with a warning in the error field.
 - Classifier input (structured signals header + body_text) sent to BART-MNLI is truncated to `BODY_TEXT_LIMIT` (2800 chars, in `config.py`). BART's tokenizer auto-truncates at 1024 tokens internally; 2800 chars gives the model more context while staying within that window.
+- Response size limit: `MAX_RESPONSE_SIZE` (10MB). Pages exceeding this are dropped with an error before any processing.
 
 ---
 
