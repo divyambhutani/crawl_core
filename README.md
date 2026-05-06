@@ -88,11 +88,9 @@ gcloud run deploy crawl-core \
 ### `POST /crawl`
 
 ```bash
-curl -X POST \
-  -H "Authorization: Bearer $API_TOKEN" \
+curl -X POST http://localhost:8000/crawl \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://www.amazon.com/dp/B009GQ034C"}' \
-  http://localhost:8000/crawl
+  -d '{"url": "http://www.amazon.com/Cuisinart-CPT-122-Compact-2-Slice-Toaster/dp/B009GQ034C/ref=sr_1_1?s=kitchen&ie=UTF8&qid=1431620315&sr=1-1&keywords=toaster"}'
 ```
 
 Response:
@@ -100,31 +98,109 @@ Response:
 ```json
 {
   "status": "success",
-  "url": "https://www.amazon.com/dp/B009GQ034C",
-  "resolved_url": "https://www.amazon.com/Cuisinart-CPT-122.../dp/B009GQ034C/",
+  "url": "http://www.amazon.com/Cuisinart-CPT-122-Compact-2-Slice-Toaster/dp/B009GQ034C/ref=sr_1_1?s=kitchen&ie=UTF8&qid=1431620315&sr=1-1&keywords=toaster",
+  "resolved_url": "https://www.amazon.com/Cuisinart-CPT-122-Compact-2-Slice-Toaster/dp/B009GQ034C/ref=sr_1_1?s=kitchen&ie=UTF8&qid=1431620315&sr=1-1&keywords=toaster",
+  "crawled_at": "2026-05-06T08:48:19.431120+00:00",
   "render_method": "curl_cffi",
+  "render_reason": "body has 1022685 chars and 101 content elements",
   "status_code": 200,
+  "content_length": 2739582,
   "metadata": {
-    "title": "Cuisinart CPT-122 2-Slice Compact Plastic Toaster...",
+    "title": "Amazon.com: Cuisinart CPT-122 2-Slice Compact Plastic Toaster, Slots for Bagels & Bread, 7 Shade Settings, Cancel/Defrost/Reheat Functions, Removable Crumb Tray, Small Kitchen Appliance for Home & Office, White: Home & Kitchen",
+    "description": "Online Shopping for Kitchen Small Appliances from a great selection of Coffee Machines, Blenders, Juicers, Ovens, Specialty Appliances, & more at everyday low prices",
+    "canonical_url": "https://www.amazon.com/Cuisinart-CPT-122-2-Slice-Compact-Plastic/dp/B009GQ034C",
+    "language": "en-us",
+    "favicon": "https://www.amazon.com/favicon.ico",
+    "open_graph": null,
+    "twitter_card": null,
     "structured_data": [],
-    "headings": { "h1": ["..."], "h2": ["..."] }
+    "headings": {
+      "h1": [
+        "Cuisinart CPT-122 2-Slice Compact Plastic Toaster, Slots for Bagels & Bread, 7 Shade Settings, Cancel/Defrost/Reheat Functions, Removable Crumb Tray, Small Kitchen Appliance for Home & Office, White",
+        "About this item",
+        "Product information",
+        "Product Summary: Cuisinart CPT-122 2-Slice Compact Plastic Toaster, Slots for Bagels & Bread, 7 Shade Settings, Cancel/Defrost/Reheat Functions, Removable Crumb Tray, Small Kitchen Appliance for Home & Office, White"
+      ],
+      "h2": [
+        "Frequently bought together",
+        "Customers who viewed this item also viewed",
+        "From the manufacturer",
+        "Where did you see a lower price?",
+        "Product Videos",
+        "Product Description",
+        "Safety and product resources",
+        "Top Brand: Cuisinart",
+        "Similar brands on Amazon",
+        "Customer reviews",
+        "Brand in this category on Amazon",
+        "Price",
+        "About this Item",
+        "Product Description",
+        "Newer Version Available",
+        "Options Available",
+        "Product Guidance & Documents",
+        "Feedback"
+      ],
+      "h3": [
+        "Shipping & Fee Details",
+        "Sorry, there was a problem.",
+        "Sorry, there was a problem.",
+        "Shipping & Fee Details",
+        "Purchase options and add-ons",
+        "Understated Elegance.",
+        "Toasting Technology Designed to Excite Your Taste Buds.",
+        "Versatility to Allow You To Toast in a Variety of Ways.",
+        "Warranty & Support",
+        "Feedback",
+        "Product Description",
+        "Brand Story",
+        "Safety documents",
+        "Customers say",
+        "Reviews with images",
+        "Top reviews from the United States",
+        "Top reviews from other countries",
+        "Color",
+        "Size",
+        "Style"
+      ]
+    }
   },
   "content": {
-    "body_text": "...",
-    "word_count": 2003,
-    "reading_time_minutes": 10.0
+    "body_text": "Cuisinart CPT-122 2-Slice Compact Plastic Toaster, Slots for Bagels & Bread, 7 Shade Settings, Cancel/Defrost/Reheat Functions, Removable Crumb Tray, Small Kitchen Appliance for Home & Office, White\nPurchase options and add-ons\nAbout this item\n- FUNCTIONS: This compact toaster is able to fit comfortably on your countertops while toasting bagels, toast and a preheat, defrost and cancel option...",
+    "word_count": 1055,
+    "reading_time_minutes": 5.3
   },
   "classification": {
-    "page_type": "product page",
-    "page_type_confidence": 0.98,
+    "page_type": "product listing",
+    "page_type_confidence": 0.334,
     "topics": [
-      { "topic": "Shopping", "relevance_score": 1.0 },
-      { "topic": "Home, Garden", "relevance_score": 0.9 }
+      { "topic": "Shopping", "relevance_score": 0.992 },
+      { "topic": "Home", "relevance_score": 0.989 },
+      { "topic": "Food", "relevance_score": 0.955 },
+      { "topic": "Arts", "relevance_score": 0.925 },
+      { "topic": "Fashion", "relevance_score": 0.917 },
+      { "topic": "Drink", "relevance_score": 0.791 }
     ],
-    "iab_categories": ["Shopping", "Home, Garden"],
-    "keywords": ["Cuisinart CPT-122 Toaster", "2-Slice Toaster", "Kitchen Appliance"],
-    "summary": "This page details the Cuisinart CPT-122 2-slice compact toaster..."
-  }
+    "iab_categories": [
+      "Shopping",
+      "Home",
+      "Food"
+    ],
+    "keywords": [
+      "Amazon.com",
+      "Cuisinart CPT-122",
+      "2-Slice Compact Plastic Toaster",
+      "Slots",
+      "Bagels",
+      "Bread",
+      "7 Shade Settings",
+      "Cancel/Defrost/Reheat Functions",
+      "Removable Crumb Tray",
+      "Small Kitchen Appliance"
+    ],
+    "summary": "Amazon.com: Cuisinart CPT-122 2-Slice Compact Plastic Toaster — a product listing about Shopping, Home, Food."
+  },
+  "error": null
 }
 ```
 
